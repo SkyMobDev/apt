@@ -63,7 +63,7 @@ jobs:
             gh release download "$pkg-v$version" --repo "$UPSTREAM" \
               --pattern "${pkg}_${version}_*.deb" --dir "$dir" --clobber
             count=$((count + 1))
-          done < <(sed 's/#.*//' stable.list)
+          done < <(sed 's/#.*//; s/\r$//' stable.list)
           [ "$count" -gt 0 ] ||
             { echo "::error::stable.list names no packages"; exit 1; }
           find pool -name '*.deb' | sort

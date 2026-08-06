@@ -50,13 +50,22 @@ guards against.
 
 Cutting a `skbridge-v*` release upstream publishes nothing here. What reaches
 customers is exactly what [`stable.list`](stable.list) names, so promotion is a
-deliberate, reviewed edit:
+deliberate, reviewed edit. [`Promote.psm1`](Promote.psm1) drives it — it needs
+PowerShell 7 and a `gh` authenticated with read access to `iot-edge`:
 
-1. install the new `.deb` from its GitHub release on a test appliance and
-   confirm it behaves,
-2. open a pull request adding the version to `stable.list` (and dropping the
-   oldest, keeping two),
-3. merge it — the push to `main` publishes.
+```powershell
+Import-Module .\Promote.psm1 -Force
+
+Get-AptChannel                            # published vs. available upstream
+Save-AptCandidate -Version 0.1.27         # pull the .deb, install it on a test VM
+New-AptPromotion  -Version 0.1.27 -Push   # branch + commit + pull request
+Test-AptChannel                           # after the merge: what the channel serves
+```
+
+`New-AptPromotion` refuses a version whose release is missing either
+architecture's `.deb`, keeps the previous version in the manifest, and stops if
+the working tree is dirty or you are not on `main`. Merging the pull request is
+what publishes.
 
 Rolling a bad version back is `git revert` on that commit: the pool is rebuilt
 from the manifest, so the package disappears from the channel and machines that

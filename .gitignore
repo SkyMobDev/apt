@@ -4,3 +4,6 @@
 /dists/
 /pool/
 /Release.tmp
+
+# Save-AptCandidate drops release builds here for testing before promotion.
+/candidates/
