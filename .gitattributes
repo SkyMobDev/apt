@@ -2,3 +2,7 @@
 # along inside a version would end up in the release tag it builds. Normalize
 # everything in this repository to LF so a Windows checkout cannot introduce one.
 * text=auto eol=lf
+
+# The published packages. Never touch these bytes — a checksum in a signed
+# index has to match what apt downloads.
+*.deb -text

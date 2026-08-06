@@ -62,10 +62,15 @@ New-AptPromotion  -Version 0.1.27 -Push   # branch + commit + pull request
 Test-AptChannel                           # after the merge: what the channel serves
 ```
 
-`New-AptPromotion` refuses a version whose release is missing either
-architecture's `.deb`, keeps the previous version in the manifest, and stops if
-the working tree is dirty or you are not on `main`. Merging the pull request is
+`New-AptPromotion` downloads both architectures' `.deb` with **your** GitHub
+access and commits them next to the manifest edit, so the pull request shows
+exactly what customers will receive. It refuses a version whose release is
+missing either architecture, keeps the previous version, and stops if the
+working tree is dirty or you are not on `main`. Merging the pull request is
 what publishes.
+
+That download is the only crossing from private to public, and a person makes
+it. CI holds no credential for `iot-edge` and cannot reach it.
 
 Rolling a bad version back is `Remove-AptPromotion -Version <bad> -Push`. It
 edits the manifest as it stands rather than reverting the promotion commit,
@@ -77,8 +82,8 @@ with `apt install skbridge=<previous>` — which is why the manifest keeps two.
 
 `.github/workflows/publish.yml` rebuilds the whole index on each run:
 
-1. downloads the `.deb` assets named by `stable.list` from the (private)
-   `SkyMobDev/iot-edge` repository,
+1. checks the committed `pool/` holds exactly the `.deb` files `stable.list`
+   names — no more, no fewer,
 2. generates `Packages`/`Release` with `apt-ftparchive` and stamps a 30-day
    `Valid-Until`,
 3. clear-signs `InRelease` and detach-signs `Release.gpg`,
@@ -88,16 +93,15 @@ with `apt install skbridge=<previous>` — which is why the manifest keeps two.
 
 Consequences worth knowing before changing anything here:
 
-- **No package is ever committed.** `dists/` and `pool/` are build output, so
-  git history stays small and the published repository is reproducible from
-  the upstream releases alone.
+- **`pool/` is committed, `dists/` is not.** Committing the packages is what
+  removes the need for any cross-repository credential in CI. The cost is that
+  each promoted version leaves about 11 MB in git history permanently, even
+  after it is withdrawn — only promotions add to that, not upstream releases.
 - **The weekly schedule is not decorative.** The `Valid-Until` stamp lapses
   30 days after a publish, and apt then rejects the index. The schedule
   re-signs it; disabling the workflow eventually takes every appliance's
   `apt update` down. It re-signs the set `stable.list` already names, so it
   cannot promote anything on its own.
-- **`RELEASES_TOKEN`** is a fine-grained PAT with `Contents: Read` on
-  `SkyMobDev/iot-edge` — the only reason this public repository can see the
-  private one.
-- **`APT_SIGNING_KEY`** holds the armored private key; `APT_SIGNING_PASSPHRASE`
-  is optional and only needed if the key is ever replaced with a protected one.
+- **`APT_SIGNING_KEY` is the only secret**, holding the armored private signing
+  key. `APT_SIGNING_PASSPHRASE` is optional and only needed if the key is ever
+  replaced with a protected one. Nothing here can read a private repository.

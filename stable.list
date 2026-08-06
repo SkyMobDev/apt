@@ -1,7 +1,10 @@
 # Packages published to https://apt.skymob.app — this file IS the promotion
-# decision. The publish workflow downloads exactly what is named here and
-# nothing else, so cutting a release upstream never reaches customers on its
-# own; someone has to add the line.
+# decision. Only what is named here is published, so cutting a release upstream
+# never reaches customers on its own.
+#
+# Edit it with New-AptPromotion / Remove-AptPromotion (Promote.psm1), not by
+# hand: the matching .deb files under pool/ have to move with it, and the
+# publish workflow refuses a commit where the two disagree.
 #
 # Format: "<package> <version>", one per line. <version> must match a
 # <package>-v<version> release tag in SkyMobDev/iot-edge.

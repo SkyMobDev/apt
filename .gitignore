@@ -1,8 +1,8 @@
-# Build output of .github/workflows/publish.yml. The pool is re-downloaded
-# from the upstream releases on every run, so no .deb belongs in git history.
+# Build output of .github/workflows/publish.yml. pool/ is NOT here: the .deb
+# files are committed, which is what lets CI publish without any credential
+# for the private repository.
 /_site/
 /dists/
-/pool/
 /Release.tmp
 
 # Save-AptCandidate drops release builds here for testing before promotion.

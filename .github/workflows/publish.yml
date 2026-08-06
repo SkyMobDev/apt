@@ -27,7 +27,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM: SkyMobDev/iot-edge
   SUITE: stable
   COMPONENT: main
   ARCHS: amd64 arm64
@@ -45,28 +44,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apt-utils
 
-      - name: collect the promoted set
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+      - name: check the pool matches stable.list
+        # The .deb files are committed by whoever ran New-AptPromotion, so this
+        # job needs no access to iot-edge at all. It only has to prove the two
+        # halves of that commit agree: a manifest entry with no package would
+        # publish a dangling index, and a package no entry names would reach
+        # customers without anyone having decided it should.
         run: |
           set -euo pipefail
-          count=0
-          # Reading from a process substitution, not a pipe, so the loop runs in
-          # this shell and its counter survives.
+          expected=$(mktemp); actual=$(mktemp)
           while read -r pkg version rest; do
             case "$pkg" in '') continue ;; esac
             { [ -n "$version" ] && [ -z "${rest:-}" ]; } ||
               { echo "::error::malformed stable.list entry: $pkg $version $rest"; exit 1; }
-            dir="pool/main/$(printf %.1s "$pkg")/$pkg"
-            mkdir -p "$dir"
-            echo "==> $pkg $version"
-            gh release download "$pkg-v$version" --repo "$UPSTREAM" \
-              --pattern "${pkg}_${version}_*.deb" --dir "$dir" --clobber
-            count=$((count + 1))
+            for arch in $ARCHS; do
+              echo "pool/main/$(printf %.1s "$pkg")/$pkg/${pkg}_${version}_${arch}.deb" >> "$expected"
+            done
           done < <(sed 's/#.*//; s/\r$//' stable.list)
-          [ "$count" -gt 0 ] ||
-            { echo "::error::stable.list names no packages"; exit 1; }
-          find pool -name '*.deb' | sort
+          [ -s "$expected" ] || { echo "::error::stable.list names no packages"; exit 1; }
+          sort -o "$expected" "$expected"
+          find pool -name '*.deb' 2>/dev/null | sort > "$actual"
+          if ! diff -u --label "named by stable.list" --label "committed in pool" \
+                 "$expected" "$actual"; then
+            echo "::error::the committed pool does not match stable.list"
+            exit 1
+          fi
+          cat "$actual"
 
       - name: build indices
         run: |

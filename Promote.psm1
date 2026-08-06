@@ -12,6 +12,11 @@
     about the channel; this public repository decides what customers receive.
     stable.list is that decision, and every function here reads or edits it.
 
+    The .deb files are downloaded here and committed to this repository, so the
+    only thing that ever crosses from private to public is a person running
+    these commands with their own GitHub access. CI holds no credential for
+    iot-edge and cannot reach it.
+
     Requires the GitHub CLI, authenticated with read access to the (private)
     iot-edge repository.
 
@@ -259,7 +264,9 @@ function Submit-ChannelChange {
     if ($LASTEXITCODE -ne 0) { throw "git switch failed" }
 
     Write-ChannelFile -Entries $Entries
-    git -C $script:RepoRoot add stable.list
+    Sync-Pool -Entries $Entries
+    # --all so the withdrawn version's .deb files are staged as deletions.
+    git -C $script:RepoRoot add --all stable.list pool
     if ($LASTEXITCODE -ne 0) { throw "git add failed" }
 
     git -C $script:RepoRoot commit -m $Subject -m $Body
@@ -282,6 +289,44 @@ function Submit-ChannelChange {
     finally { Pop-Location }
 
     Write-Host "Merging that PR publishes the channel. Squash with the commit subject as the title." -ForegroundColor Green
+}
+
+function Get-PoolPath {
+    param([Parameter(Mandatory)][string]$Package)
+
+    Join-Path $script:RepoRoot "pool/main/$($Package.Substring(0, 1))/$Package"
+}
+
+function Sync-Pool {
+    <#
+    .SYNOPSIS
+        Makes the committed pool hold exactly the .deb files the manifest names.
+    #>
+    param([Parameter(Mandatory)][pscustomobject[]]$Entries)
+
+    $wanted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $Entries) {
+        $dir = Get-PoolPath -Package $entry.Package
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        foreach ($arch in $script:Architectures) {
+            $file = "$($entry.Package)_$($entry.Version)_$arch.deb"
+            [void]$wanted.Add($file)
+            if (Test-Path -LiteralPath (Join-Path $dir $file)) { continue }
+
+            Write-Host "    fetching $file" -ForegroundColor DarkGray
+            gh release download "$($entry.Package)-v$($entry.Version)" --repo $script:Upstream `
+                --pattern $file --dir $dir --clobber 2>&1 | Write-Verbose
+            if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $file" }
+        }
+    }
+
+    $pool = Join-Path $script:RepoRoot 'pool'
+    if (-not (Test-Path -LiteralPath $pool)) { return }
+    foreach ($stale in Get-ChildItem -LiteralPath $pool -Filter '*.deb' -Recurse -File) {
+        if ($wanted.Contains($stale.Name)) { continue }
+        Write-Host "    removing $($stale.Name)" -ForegroundColor DarkGray
+        Remove-Item -LiteralPath $stale.FullName -Force
+    }
 }
 
 function Read-ChannelFile {
