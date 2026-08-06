@@ -5,14 +5,15 @@ name: publish
 # from the upstream releases each time, so the published repository is
 # reproducible from those releases alone and no .deb ever enters git history.
 on:
+  # Merging a change to stable.list publishes it: the review on that pull
+  # request is the promotion gate, and `git revert` is the rollback.
+  push:
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      keep:
-        description: How many skbridge releases to keep in the pool
-        default: "5"
   # The Release file carries a Valid-Until (see VALID_DAYS below). apt refuses
   # an index once it lapses, so the schedule re-signs long before that — a
   # missed week is harmless, a missed month takes every appliance offline.
+  # It re-signs the set stable.list already names; it never promotes anything.
   schedule:
     - cron: "17 4 * * 1"
 
@@ -44,23 +45,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apt-utils
 
-      - name: collect packages from upstream releases
+      - name: collect the promoted set
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-          KEEP: ${{ inputs.keep || '5' }}
         run: |
           set -euo pipefail
-          mkdir -p pool/main/s/skbridge
-          tags=$(gh release list --repo "$UPSTREAM" --limit 100 --json tagName \
-                   --jq '.[].tagName | select(startswith("skbridge-v"))' |
-                 sort -V | tail -n "$KEEP")
-          [ -n "$tags" ] || { echo "::error::no skbridge-v* releases on $UPSTREAM"; exit 1; }
-          for tag in $tags; do
-            echo "==> $tag"
-            gh release download "$tag" --repo "$UPSTREAM" --pattern '*.deb' \
-              --dir pool/main/s/skbridge --clobber
-          done
-          ls -l pool/main/s/skbridge
+          count=0
+          # Reading from a process substitution, not a pipe, so the loop runs in
+          # this shell and its counter survives.
+          while read -r pkg version rest; do
+            case "$pkg" in '') continue ;; esac
+            { [ -n "$version" ] && [ -z "${rest:-}" ]; } ||
+              { echo "::error::malformed stable.list entry: $pkg $version $rest"; exit 1; }
+            dir="pool/main/$(printf %.1s "$pkg")/$pkg"
+            mkdir -p "$dir"
+            echo "==> $pkg $version"
+            gh release download "$pkg-v$version" --repo "$UPSTREAM" \
+              --pattern "${pkg}_${version}_*.deb" --dir "$dir" --clobber
+            count=$((count + 1))
+          done < <(sed 's/#.*//' stable.list)
+          [ "$count" -gt 0 ] ||
+            { echo "::error::stable.list names no packages"; exit 1; }
+          find pool -name '*.deb' | sort
 
       - name: build indices
         run: |

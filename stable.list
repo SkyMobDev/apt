@@ -1,0 +1,14 @@
+# Packages published to https://apt.skymob.app — this file IS the promotion
+# decision. The publish workflow downloads exactly what is named here and
+# nothing else, so cutting a release upstream never reaches customers on its
+# own; someone has to add the line.
+#
+# Format: "<package> <version>", one per line. <version> must match a
+# <package>-v<version> release tag in SkyMobDev/iot-edge.
+#
+# Keep the previous version listed too: apt installs the newest by default,
+# and the older one in the pool is what makes `apt install skbridge=<old>`
+# work when a site has to go back.
+
+skbridge 0.1.26
+skbridge 0.1.24

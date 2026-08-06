@@ -46,12 +46,28 @@ published here alongside a transition announcement — a rotation that broke
 `apt update` on every appliance at once would be worse than the risk it
 guards against.
 
+## Promoting a release
+
+Cutting a `skbridge-v*` release upstream publishes nothing here. What reaches
+customers is exactly what [`stable.list`](stable.list) names, so promotion is a
+deliberate, reviewed edit:
+
+1. install the new `.deb` from its GitHub release on a test appliance and
+   confirm it behaves,
+2. open a pull request adding the version to `stable.list` (and dropping the
+   oldest, keeping two),
+3. merge it — the push to `main` publishes.
+
+Rolling a bad version back is `git revert` on that commit: the pool is rebuilt
+from the manifest, so the package disappears from the channel and machines that
+already took it can return with `apt install skbridge=<previous>`.
+
 ## How this repository is published
 
 `.github/workflows/publish.yml` rebuilds the whole index on each run:
 
-1. downloads the `.deb` assets of the newest `skbridge-v*` releases from the
-   (private) `SkyMobDev/iot-edge` repository,
+1. downloads the `.deb` assets named by `stable.list` from the (private)
+   `SkyMobDev/iot-edge` repository,
 2. generates `Packages`/`Release` with `apt-ftparchive` and stamps a 30-day
    `Valid-Until`,
 3. clear-signs `InRelease` and detach-signs `Release.gpg`,
@@ -67,7 +83,8 @@ Consequences worth knowing before changing anything here:
 - **The weekly schedule is not decorative.** The `Valid-Until` stamp lapses
   30 days after a publish, and apt then rejects the index. The schedule
   re-signs it; disabling the workflow eventually takes every appliance's
-  `apt update` down.
+  `apt update` down. It re-signs the set `stable.list` already names, so it
+  cannot promote anything on its own.
 - **`RELEASES_TOKEN`** is a fine-grained PAT with `Contents: Read` on
   `SkyMobDev/iot-edge` — the only reason this public repository can see the
   private one.
