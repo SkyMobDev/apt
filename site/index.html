@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SkyMob apt repository</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1d21;
+    --muted: #5c6570;
+    --rule: #e3e7eb;
+    --code-bg: #f5f7f9;
+    --accent: #0b6ec4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a;
+      --fg: #e6e9ec;
+      --muted: #9aa4ae;
+      --rule: #2a2f35;
+      --code-bg: #1c2126;
+      --accent: #61aef0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto;
+    padding: 3rem 1.25rem 4rem;
+    max-width: 46rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  h2 { font-size: 1.05rem; margin: 2.5rem 0 .75rem; letter-spacing: -.005em; }
+  .lede { color: var(--muted); margin: 0 0 2rem; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 1rem;
+    overflow-x: auto;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  p code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  .fpr { font-size: 14px; letter-spacing: .04em; }
+  a { color: var(--accent); }
+  footer {
+    margin-top: 3rem; padding-top: 1.25rem;
+    border-top: 1px solid var(--rule);
+    color: var(--muted); font-size: .875rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>SkyMob apt repository</h1>
+<p class="lede">Signed Debian package channel for the SkyMob edge appliances.</p>
+
+<p>Carries <code>skbridge</code>, the LAN&#8596;cloud bridge appliance, for
+<code>amd64</code> (virtual machines) and <code>arm64</code> (the physical
+appliance). Requires <strong>Debian 13 (trixie)</strong>.</p>
+
+<h2>Install</h2>
+<pre><code>sudo apt install -y curl
+sudo install -d /etc/apt/keyrings
+sudo curl -fsSL https://apt.skymob.app/skymob.asc -o /etc/apt/keyrings/skymob.asc
+sudo tee /etc/apt/sources.list.d/skymob.sources &gt;/dev/null &lt;&lt;'EOF'
+Types: deb
+URIs: https://apt.skymob.app
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/skymob.asc
+EOF
+sudo apt update
+sudo apt install skbridge</code></pre>
+
+<p>Every later upgrade is <code>sudo apt upgrade</code>.</p>
+
+<h2>Signing key</h2>
+<p><a href="skymob.asc">skymob.asc</a> &mdash; verify with
+<code>gpg --show-keys</code> before trusting it:</p>
+<pre class="fpr"><code>CB08 8823 E147 2096 157A  7917 ABEF 2B35 90BE B0ED</code></pre>
+
+<footer>
+  <a href="https://skymob.com.br">skymob.com.br</a>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,156 @@
+name: publish
+
+# Rebuilds the apt index from scratch on every run and deploys it to Pages.
+# Nothing is incremental and nothing is committed: the pool is re-downloaded
+# from the upstream releases each time, so the published repository is
+# reproducible from those releases alone and no .deb ever enters git history.
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: How many skbridge releases to keep in the pool
+        default: "5"
+  # The Release file carries a Valid-Until (see VALID_DAYS below). apt refuses
+  # an index once it lapses, so the schedule re-signs long before that — a
+  # missed week is harmless, a missed month takes every appliance offline.
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: SkyMobDev/iot-edge
+  SUITE: stable
+  COMPONENT: main
+  ARCHS: amd64 arm64
+  VALID_DAYS: "30"
+  KEY_FINGERPRINT: CB088823E1472096157A7917ABEF2B3590BEB0ED
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install apt-ftparchive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils
+
+      - name: collect packages from upstream releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          KEEP: ${{ inputs.keep || '5' }}
+        run: |
+          set -euo pipefail
+          mkdir -p pool/main/s/skbridge
+          tags=$(gh release list --repo "$UPSTREAM" --limit 100 --json tagName \
+                   --jq '.[].tagName | select(startswith("skbridge-v"))' |
+                 sort -V | tail -n "$KEEP")
+          [ -n "$tags" ] || { echo "::error::no skbridge-v* releases on $UPSTREAM"; exit 1; }
+          for tag in $tags; do
+            echo "==> $tag"
+            gh release download "$tag" --repo "$UPSTREAM" --pattern '*.deb' \
+              --dir pool/main/s/skbridge --clobber
+          done
+          ls -l pool/main/s/skbridge
+
+      - name: build indices
+        run: |
+          set -euo pipefail
+          for arch in $ARCHS; do
+            dir="dists/$SUITE/$COMPONENT/binary-$arch"
+            mkdir -p "$dir"
+            apt-ftparchive --arch "$arch" packages pool > "$dir/Packages"
+            gzip -9kf "$dir/Packages"
+          done
+          # Written outside the scanned tree first: a redirect straight into
+          # dists/ would let apt-ftparchive hash the half-written Release into
+          # its own checksums.
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=SkyMob \
+            -o APT::FTPArchive::Release::Label=SkyMob \
+            -o APT::FTPArchive::Release::Suite="$SUITE" \
+            -o APT::FTPArchive::Release::Codename="$SUITE" \
+            -o APT::FTPArchive::Release::Architectures="$ARCHS" \
+            -o APT::FTPArchive::Release::Components="$COMPONENT" \
+            -o APT::FTPArchive::Release::Description="SkyMob edge appliance packages" \
+            release "dists/$SUITE" > Release.tmp
+          # apt-ftparchive emits no Valid-Until; without one a captured index
+          # can be replayed at a stale version forever.
+          valid=$(date -u -d "+$VALID_DAYS days" '+%a, %d %b %Y %H:%M:%S UTC')
+          sed -i "/^Date: /a Valid-Until: $valid" Release.tmp
+          mv Release.tmp "dists/$SUITE/Release"
+          cat "dists/$SUITE/Release"
+
+      - name: sign
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          GNUPGHOME=$(mktemp -d); export GNUPGHOME; chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --quiet --import
+          args=(--batch --yes --quiet --armor --digest-algo SHA512
+                --local-user "$KEY_FINGERPRINT")
+          # Supports a passphrase-protected key without requiring one: the
+          # secret is optional, and an unset one leaves the loopback pinentry
+          # out entirely.
+          if [ -n "${APT_SIGNING_PASSPHRASE:-}" ]; then
+            printf '%s' "$APT_SIGNING_PASSPHRASE" > "$GNUPGHOME/pw"
+            chmod 600 "$GNUPGHOME/pw"
+            args+=(--pinentry-mode loopback --passphrase-file "$GNUPGHOME/pw")
+          fi
+          gpg "${args[@]}" --clearsign   -o "dists/$SUITE/InRelease"   "dists/$SUITE/Release"
+          gpg "${args[@]}" --detach-sign -o "dists/$SUITE/Release.gpg" "dists/$SUITE/Release"
+          rm -rf "$GNUPGHOME"
+
+      - name: assemble site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -r dists pool _site/
+          cp skymob.asc CNAME _site/
+          cp site/index.html _site/index.html
+
+      - name: verify the index installs on Debian 13
+        # Runs against the exact tree that deploys, on the distro we support,
+        # through apt itself: a bad signature, a missing arch index or an
+        # unsatisfiable dependency fails here instead of on the appliances.
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/_site:/site:ro" debian:13-slim bash -eux -c '
+            install -d /etc/apt/keyrings
+            cp /site/skymob.asc /etc/apt/keyrings/skymob.asc
+            printf "%s\n" \
+              "Types: deb" \
+              "URIs: file:///site" \
+              "Suites: stable" \
+              "Components: main" \
+              "Signed-By: /etc/apt/keyrings/skymob.asc" \
+              > /etc/apt/sources.list.d/skymob.sources
+            apt-get update
+            apt-cache policy skbridge
+            apt-get install -y --download-only skbridge
+          '
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

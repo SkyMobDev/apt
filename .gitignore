@@ -1,0 +1,6 @@
+# Build output of .github/workflows/publish.yml. The pool is re-downloaded
+# from the upstream releases on every run, so no .deb belongs in git history.
+/_site/
+/dists/
+/pool/
+/Release.tmp
