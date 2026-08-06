@@ -46,6 +46,37 @@ published here alongside a transition announcement — a rotation that broke
 `apt update` on every appliance at once would be worse than the risk it
 guards against.
 
+### Where the private key lives, and how to get it back
+
+Three copies, and no fourth:
+
+| Copy | Purpose |
+|---|---|
+| `APT_SIGNING_KEY` secret on this repository | what CI signs with — write-only, GitHub never reads it back |
+| `apt-signing-key` in Azure Key Vault `SkyMobSecrets` | the recoverable copy |
+| `apt-signing-key-revocation` in the same vault | the revocation certificate, the only way to publicly retire the key if it leaks |
+
+Restoring it — after a lost Actions secret, or to sign something by hand:
+
+```bash
+az keyvault secret download --vault-name SkyMobSecrets --name apt-signing-key \
+  --file key.asc --encoding utf-8
+
+# Windows writes CRLF here; the secret should hold the armor exactly as gpg
+# emitted it, so strip them on the way in.
+tr -d '\r' < key.asc | gh secret set APT_SIGNING_KEY --repo SkyMobDev/apt
+
+gpg --batch --import key.asc      # only if you need to sign locally
+rm -f key.asc
+```
+
+Confirm you got the right key before trusting it — the fingerprint above must
+match `gpg --show-keys key.asc`.
+
+Losing all three copies is recoverable but expensive: a new key means every
+appliance needs its `/etc/apt/keyrings/skymob.asc` replaced by hand before
+`apt update` works again.
+
 ## Promoting a release
 
 Cutting a `skbridge-v*` release upstream publishes nothing here. What reaches
