@@ -67,9 +67,11 @@ architecture's `.deb`, keeps the previous version in the manifest, and stops if
 the working tree is dirty or you are not on `main`. Merging the pull request is
 what publishes.
 
-Rolling a bad version back is `git revert` on that commit: the pool is rebuilt
-from the manifest, so the package disappears from the channel and machines that
-already took it can return with `apt install skbridge=<previous>`.
+Rolling a bad version back is `Remove-AptPromotion -Version <bad> -Push`. It
+edits the manifest as it stands rather than reverting the promotion commit,
+which stops working as soon as a later promotion has touched the same file. The
+pool is rebuilt without that version, and machines that already took it return
+with `apt install skbridge=<previous>` — which is why the manifest keeps two.
 
 ## How this repository is published
 

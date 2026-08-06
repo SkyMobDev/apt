@@ -18,11 +18,12 @@
 .EXAMPLE
     Import-Module .\Promote.psm1 -Force
 
-    Get-AptChannel                          # published vs. available upstream
-    Save-AptCandidate -Version 0.1.27       # download the .deb to test with
-    New-AptPromotion  -Version 0.1.27       # branch + commit the manifest edit
-    New-AptPromotion  -Version 0.1.27 -Push # ...and push it and open the PR
-    Test-AptChannel                         # what the live channel serves
+    Get-AptChannel                             # published vs. available upstream
+    Save-AptCandidate   -Version 0.1.27        # download the .deb to test with
+    New-AptPromotion    -Version 0.1.27        # branch + commit the manifest edit
+    New-AptPromotion    -Version 0.1.27 -Push  # ...and push it and open the PR
+    Test-AptChannel                            # what the live channel serves
+    Remove-AptPromotion -Version 0.1.27 -Push  # roll it back off the channel
 #>
 
 $script:RepoRoot      = $PSScriptRoot
@@ -103,12 +104,7 @@ function New-AptPromotion {
         [switch]$Push
     )
 
-    $status = git -C $script:RepoRoot status --porcelain
-    if ($status) { throw "working tree is dirty; commit or stash before promoting" }
-
-    $branch = git -C $script:RepoRoot branch --show-current
-    if ($branch -ne 'main') { throw "promote from main, not '$branch'" }
-
+    Assert-CleanMain
     Assert-ReleaseAssets -Package $Package -Version $Version
 
     $entries = Read-ChannelFile
@@ -134,38 +130,56 @@ function New-AptPromotion {
         return
     }
 
-    # --no-track: main is the base, not the upstream — the branch pushes to its
-    # own remote ref.
-    git -C $script:RepoRoot switch --create $target --no-track
-    if ($LASTEXITCODE -ne 0) { throw "git switch failed" }
-
-    Write-ChannelFile -Entries $updated
-    git -C $script:RepoRoot add stable.list
-    if ($LASTEXITCODE -ne 0) { throw "git add failed" }
-
     $subject = "feat: promove $Package $Version para o canal stable"
     $body = "Sites em Debian 13 passam a receber $Package $Version por ``apt upgrade``."
     if ($dropped) { $body += "`n`nSai do pool: $($dropped -join ', ')." }
-    git -C $script:RepoRoot commit -m $subject -m $body
-    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
-    Write-Host "Committed on $target" -ForegroundColor Green
+    Submit-ChannelChange -Entries $updated -Branch $target -Subject $subject -Body $body -Push:$Push
+}
 
-    if (-not $Push) {
-        Write-Host "When ready: New-AptPromotion -Version $Version -Push (or push $target yourself)" -ForegroundColor DarkGray
+function Remove-AptPromotion {
+    <#
+    .SYNOPSIS
+        Takes a version off the channel, leaving the pool serving the previous one.
+
+    .DESCRIPTION
+        The rollback counterpart of New-AptPromotion. Reverting the promotion
+        commit only works while nothing else has touched the manifest since;
+        this edits the current state instead, so it works at any distance from
+        the promotion.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Version,
+        [string]$Package = 'skbridge',
+        [switch]$Push
+    )
+
+    Assert-CleanMain
+
+    $entries = Read-ChannelFile
+    if (-not ($entries | Where-Object { $_.Package -eq $Package -and $_.Version -eq $Version })) {
+        throw "$Package $Version is not on the channel"
+    }
+
+    $updated = @($entries | Where-Object { -not ($_.Package -eq $Package -and $_.Version -eq $Version) })
+    $remaining = @($updated | Where-Object Package -EQ $Package).Version
+    # An empty channel is worse than a bad version: `apt install` stops
+    # resolving at all, including on machines that never took the bad one.
+    if (-not $remaining) { throw "that is the only $Package version on the channel; promote a replacement first" }
+
+    Write-Host "==> withdrawing $Package $Version" -ForegroundColor Cyan
+    Write-Host "    channel becomes: $($remaining -join ', ')"
+
+    $target = "withdraw/$Package-$Version"
+    if (-not $PSCmdlet.ShouldProcess($script:ChannelFile, "withdraw $Package $Version on branch $target")) {
         return
     }
 
-    git -C $script:RepoRoot push --set-upstream origin $target
-    if ($LASTEXITCODE -ne 0) { throw "git push failed" }
-
-    Push-Location $script:RepoRoot
-    try {
-        gh pr create --base main --head $target --title $subject --body $body
-        if ($LASTEXITCODE -ne 0) { throw "gh pr create failed" }
-    }
-    finally { Pop-Location }
-
-    Write-Host "Merging that PR publishes the channel. Squash with the commit subject as the title." -ForegroundColor Green
+    $fallback = ($remaining | Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } })[0]
+    $subject = "revert: retira $Package $Version do canal stable"
+    $body = "O canal volta a servir $Package $fallback. " +
+    "Sites que já atualizaram voltam com ``apt install $Package=$fallback``."
+    Submit-ChannelChange -Entries $updated -Branch $target -Subject $subject -Body $body -Push:$Push
 }
 
 function Test-AptChannel {
@@ -220,6 +234,54 @@ function Test-AptChannel {
     }
 
     return $healthy
+}
+
+function Assert-CleanMain {
+    $status = git -C $script:RepoRoot status --porcelain
+    if ($status) { throw "working tree is dirty; commit or stash first" }
+
+    $branch = git -C $script:RepoRoot branch --show-current
+    if ($branch -ne 'main') { throw "run this from main, not '$branch'" }
+}
+
+function Submit-ChannelChange {
+    param(
+        [Parameter(Mandatory)][pscustomobject[]]$Entries,
+        [Parameter(Mandatory)][string]$Branch,
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][string]$Body,
+        [switch]$Push
+    )
+
+    # --no-track: main is the base, not the upstream — the branch pushes to its
+    # own remote ref.
+    git -C $script:RepoRoot switch --create $Branch --no-track
+    if ($LASTEXITCODE -ne 0) { throw "git switch failed" }
+
+    Write-ChannelFile -Entries $Entries
+    git -C $script:RepoRoot add stable.list
+    if ($LASTEXITCODE -ne 0) { throw "git add failed" }
+
+    git -C $script:RepoRoot commit -m $Subject -m $Body
+    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+    Write-Host "Committed on $Branch" -ForegroundColor Green
+
+    if (-not $Push) {
+        Write-Host "When ready: re-run with -Push, or push $Branch and open the PR yourself" -ForegroundColor DarkGray
+        return
+    }
+
+    git -C $script:RepoRoot push --set-upstream origin $Branch
+    if ($LASTEXITCODE -ne 0) { throw "git push failed" }
+
+    Push-Location $script:RepoRoot
+    try {
+        gh pr create --base main --head $Branch --title $Subject --body $Body
+        if ($LASTEXITCODE -ne 0) { throw "gh pr create failed" }
+    }
+    finally { Pop-Location }
+
+    Write-Host "Merging that PR publishes the channel. Squash with the commit subject as the title." -ForegroundColor Green
 }
 
 function Read-ChannelFile {
@@ -291,4 +353,5 @@ function ConvertTo-SortableVersion {
     [version](($Version -split '-')[0])
 }
 
-Export-ModuleMember -Function Get-AptChannel, Save-AptCandidate, New-AptPromotion, Test-AptChannel
+Export-ModuleMember -Function Get-AptChannel, Save-AptCandidate, New-AptPromotion,
+Remove-AptPromotion, Test-AptChannel
