@@ -115,7 +115,7 @@ with `apt install skbridge=<previous>` — which is why the manifest keeps two.
 
 1. checks the committed `pool/` holds exactly the `.deb` files `stable.list`
    names — no more, no fewer,
-2. generates `Packages`/`Release` with `apt-ftparchive` and stamps a 30-day
+2. generates `Packages`/`Release` with `apt-ftparchive` and stamps a 90-day
    `Valid-Until`,
 3. clear-signs `InRelease` and detach-signs `Release.gpg`,
 4. installs the result inside a `debian:13-slim` container through apt itself
@@ -129,10 +129,17 @@ Consequences worth knowing before changing anything here:
   each promoted version leaves about 11 MB in git history permanently, even
   after it is withdrawn — only promotions add to that, not upstream releases.
 - **The weekly schedule is not decorative.** The `Valid-Until` stamp lapses
-  30 days after a publish, and apt then rejects the index. The schedule
-  re-signs it; disabling the workflow eventually takes every appliance's
-  `apt update` down. It re-signs the set `stable.list` already names, so it
-  cannot promote anything on its own.
+  90 days after a publish, and apt then rejects the index outright — it will
+  not fall back to cached lists. The schedule re-signs it and cannot promote
+  anything, since it publishes the set `stable.list` already names.
+
+  The window is far longer than the cadence on purpose. GitHub neither retries
+  nor backfills a dropped scheduled run, and it **disables schedules after 60
+  days of repository inactivity** — so the realistic failure is not a run
+  failing loudly but the schedule quietly ceasing to exist. Any push resets
+  that clock, so promoting every couple of months keeps it alive by itself.
+  `Test-AptChannel` reports how long ago the index was signed, which goes bad
+  within days of a missed cycle rather than months later.
 - **`APT_SIGNING_KEY` is the only secret**, holding the armored private signing
   key. `APT_SIGNING_PASSPHRASE` is optional and only needed if the key is ever
   replaced with a protected one. Nothing here can read a private repository.

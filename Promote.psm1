@@ -38,6 +38,10 @@ $script:ChannelUrl    = 'https://apt.skymob.app'
 $script:Suite         = 'stable'
 $script:Architectures = @('amd64', 'arm64')
 
+# The index is re-signed weekly, so anything older than this means at least one
+# cycle was missed. GitHub neither retries nor backfills a dropped schedule.
+$script:MaxSignedAgeDays = 10
+
 function Get-AptChannel {
     <#
     .SYNOPSIS
@@ -198,29 +202,35 @@ function Test-AptChannel {
 
     $healthy = $true
 
-    $inRelease = (Invoke-WebRequest "$Url/dists/$($script:Suite)/InRelease").Content
-    $validUntil = Read-ReleaseField $inRelease 'Valid-Until'
-    $date = Read-ReleaseField $inRelease 'Date'
+    $inRelease = Get-TextResource "$Url/dists/$($script:Suite)/InRelease"
     Write-Host "==> $Url ($($script:Suite))" -ForegroundColor Cyan
-    Write-Host "    signed:      $date"
 
-    # The weekly re-sign keeps this ahead; if it ever goes negative, every
-    # appliance's `apt update` is already failing.
-    $remaining = ([datetime]::ParseExact(
-            $validUntil, "ddd, dd MMM yyyy HH:mm:ss 'UTC'",
-            [cultureinfo]::InvariantCulture,
-            [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
-            [System.Globalization.DateTimeStyles]::AdjustToUniversal) - [datetime]::UtcNow).TotalDays
-    $colour = if ($remaining -lt 7) { 'Red' } else { 'DarkGray' }
+    # Age is the early signal. Valid-Until only trips once re-signing has been
+    # broken for most of the window, by which point the schedule has usually
+    # been dead for months; a stale signing date says so within days.
+    $signedAge = ([datetime]::UtcNow - (ConvertFrom-ReleaseDate (Read-ReleaseField $inRelease 'Date'))).TotalDays
+    $stale = $signedAge -gt $script:MaxSignedAgeDays
+    Write-Host "    signed:      $([math]::Round($signedAge, 1)) days ago" `
+        -ForegroundColor $(if ($stale) { 'Red' } else { 'DarkGray' })
+    if ($stale) {
+        Write-Warning ("last signed $([math]::Round($signedAge, 1)) days ago — the weekly publish " +
+            "workflow has missed a cycle. Check that it is not disabled (GitHub turns off " +
+            "schedules after 60 days of repository inactivity).")
+        $healthy = $false
+    }
+
+    $validUntil = Read-ReleaseField $inRelease 'Valid-Until'
+    $remaining = ((ConvertFrom-ReleaseDate $validUntil) - [datetime]::UtcNow).TotalDays
+    $colour = if ($remaining -lt 14) { 'Red' } else { 'DarkGray' }
     Write-Host "    valid until: $validUntil ($([math]::Round($remaining, 1)) days)" -ForegroundColor $colour
-    if ($remaining -lt 7) {
-        Write-Warning "index expires in under a week — is the weekly publish workflow still running?"
+    if ($remaining -lt 14) {
+        Write-Warning "index expires in under two weeks — publish now or apt update starts failing everywhere."
         $healthy = $false
     }
 
     $promoted = Read-ChannelFile
     foreach ($arch in $script:Architectures) {
-        $packages = (Invoke-WebRequest "$Url/dists/$($script:Suite)/main/binary-$arch/Packages").Content
+        $packages = Get-TextResource "$Url/dists/$($script:Suite)/main/binary-$arch/Packages"
         $served = @($packages -split '\r?\n\r?\n' | Where-Object { $_.Trim() } | ForEach-Object {
                 [pscustomobject]@{
                     Package = Read-ReleaseField $_ 'Package'
@@ -376,6 +386,41 @@ function Assert-ReleaseAssets {
             throw "release '$tag' carries no $expected — did the linux publish leg fail?"
         }
     }
+}
+
+function Get-TextResource {
+    <#
+    .SYNOPSIS
+        Fetches a repository file as text. Pages serves the index files with a
+        binary content type, for which Invoke-WebRequest yields a byte array
+        rather than a string.
+    #>
+    param([Parameter(Mandatory)][string]$Uri)
+
+    $content = (Invoke-WebRequest $Uri).Content
+    if ($content -is [byte[]]) {
+        return [System.Text.Encoding]::UTF8.GetString($content)
+    }
+    return [string]$content
+}
+
+function ConvertFrom-ReleaseDate {
+    <#
+    .SYNOPSIS
+        Parses a Release timestamp as UTC. apt-ftparchive writes Date with a
+        numeric offset while the Valid-Until this repository stamps ends in a
+        literal "UTC", so both spellings have to parse.
+    #>
+    param([Parameter(Mandatory)][string]$Value)
+
+    if ($Value.EndsWith(' UTC')) {
+        return [datetime]::ParseExact(
+            $Value, "ddd, dd MMM yyyy HH:mm:ss 'UTC'",
+            [cultureinfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
+            [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+    }
+    return [datetimeoffset]::Parse($Value, [cultureinfo]::InvariantCulture).UtcDateTime
 }
 
 function Read-ReleaseField {

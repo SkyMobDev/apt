@@ -10,10 +10,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-  # The Release file carries a Valid-Until (see VALID_DAYS below). apt refuses
-  # an index once it lapses, so the schedule re-signs long before that — a
-  # missed week is harmless, a missed month takes every appliance offline.
-  # It re-signs the set stable.list already names; it never promotes anything.
+  # The Release file carries a Valid-Until (see VALID_DAYS below); apt refuses
+  # an index once it lapses, so this re-stamps and re-signs it. GitHub neither
+  # retries nor backfills a missed occurrence, and it disables schedules after
+  # 60 days of repository inactivity — hence a window far longer than the
+  # cadence. Runs at :17 because crons on the hour are likelier to be dropped
+  # under load. It re-signs the set stable.list already names, never promotes.
   schedule:
     - cron: "17 4 * * 1"
 
@@ -30,7 +32,7 @@ env:
   SUITE: stable
   COMPONENT: main
   ARCHS: amd64 arm64
-  VALID_DAYS: "30"
+  VALID_DAYS: "90"
   KEY_FINGERPRINT: CB088823E1472096157A7917ABEF2B3590BEB0ED
 
 jobs:
