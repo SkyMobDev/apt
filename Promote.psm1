@@ -10,7 +10,14 @@
 
     The boundary this keeps: SkyMobDev/iot-edge cuts releases and knows nothing
     about the channel; this public repository decides what customers receive.
-    stable.list is that decision, and every function here reads or edits it.
+    stable.list and beta.list are that decision, and every function here reads
+    or edits one of them.
+
+    Two channels, one pool. A site subscribes to stable alone, or to stable and
+    beta together, in which case apt takes whichever version is higher and the
+    site is a canary. A version normally lands on beta first, soaks, and is then
+    moved to stable — Move-AptPromotion does that without downloading anything,
+    since the .deb is already in the pool.
 
     The .deb files are downloaded here and committed to this repository, so the
     only thing that ever crosses from private to public is a person running
@@ -23,21 +30,38 @@
 .EXAMPLE
     Import-Module .\Promote.psm1 -Force
 
-    Get-AptChannel                                  # every package: published vs. upstream
-    Get-AptChannel      -Package skprinter          # just the one
-    Save-AptCandidate   -Package skbridge -Version 0.1.41        # .deb to test with
-    New-AptPromotion    -Package skbridge -Version 0.1.41        # branch + commit
-    New-AptPromotion    -Package skbridge -Version 0.1.41 -Push  # ...and open the PR
-    Test-AptChannel                                 # what the live channel serves
-    Remove-AptPromotion -Package skbridge -Version 0.1.41 -Push  # roll it back off
+    Get-AptChannel                          # every package: which channel, vs. upstream
+    Get-AptChannel      -Package skprinter  # just the one
+
+    Save-AptCandidate   -Package skbridge -Version 0.2.0         # .deb to test with
+    New-AptPromotion    -Package skbridge -Version 0.2.0 -Channel beta -Push
+    #   ...canaries take it, it soaks...
+    Move-AptPromotion   -Package skbridge -Version 0.2.0 -Push   # beta -> stable
+
+    Test-AptChannel                                              # what the live channels serve
+    Remove-AptPromotion -Package skbridge -Version 0.2.0 -Channel beta -Push
 #>
 
 $script:RepoRoot      = $PSScriptRoot
-$script:ChannelFile   = Join-Path $PSScriptRoot 'stable.list'
 $script:Upstream      = 'SkyMobDev/iot-edge'
 $script:ChannelUrl    = 'https://apt.skymob.app'
-$script:Suite         = 'stable'
 $script:Architectures = @('amd64', 'arm64')
+
+# Each channel is an apt suite and a manifest of the same name. stable is listed
+# first only so reports read in that order; nothing depends on the position.
+$script:Channels = @('stable', 'beta')
+
+# stable must never be empty — `apt install` stops resolving entirely, including
+# on machines that never took a bad version. beta is allowed to drain to nothing
+# between candidates: canaries subscribe to both suites and simply fall through
+# to stable, and an empty suite is something apt reads without complaint.
+$script:RequiredChannels = @('stable')
+
+# Versions of a package each channel keeps in the pool. stable keeps two: apt
+# can only downgrade to a version the pool still carries, so the older one is
+# what a site retreats to. beta keeps one, because a canary retreats to stable
+# rather than to an older candidate.
+$script:ChannelKeep = @{ stable = 2; beta = 1 }
 
 # Upstream tags are named for the project that builds them, which is not always
 # the Debian package that project produces. SKPrinter.Appliance tags as
@@ -57,7 +81,7 @@ $script:MaxSignedAgeDays = 10
 function Get-AptChannel {
     <#
     .SYNOPSIS
-        Lists every upstream release of a package and whether it is published.
+        Lists every upstream release of a package and which channels carry it.
         With no -Package, reports on every package the channel knows about.
     #>
     [CmdletBinding()]
@@ -68,7 +92,13 @@ function Get-AptChannel {
     }
 
     $prefix = Get-ReleaseTagPrefix -Package $Package
-    $published = @(Read-ChannelFile | Where-Object Package -EQ $Package).Version
+    $onChannel = @{}
+    foreach ($channel in $script:Channels) {
+        foreach ($entry in Read-ChannelFile -Channel $channel | Where-Object Package -EQ $Package) {
+            $onChannel[$entry.Version] = @($onChannel[$entry.Version]) + $channel |
+                Where-Object { $_ }
+        }
+    }
 
     $tags = gh release list --repo $script:Upstream --limit 100 --json tagName `
         --jq ".[].tagName | select(startswith(`"$prefix-v`"))" 2>&1
@@ -81,7 +111,7 @@ function Get-AptChannel {
             [pscustomobject]@{
                 Package = $Package
                 Version = $_
-                Status  = if ($published -contains $_) { 'published' } else { 'available' }
+                Status  = if ($onChannel.ContainsKey($_)) { $onChannel[$_] -join '+' } else { 'available' }
             }
         }
 }
@@ -116,28 +146,34 @@ function Save-AptCandidate {
 function New-AptPromotion {
     <#
     .SYNOPSIS
-        Puts a version on the channel: edits stable.list on a branch, and with
-        -Push opens the pull request whose merge publishes it.
+        Puts a version on a channel: edits that channel's manifest on a branch,
+        and with -Push opens the pull request whose merge publishes it.
+
+    .DESCRIPTION
+        -Channel is required rather than defaulted. The two channels reach very
+        different numbers of machines, and a flag you can forget is not the
+        thing that should decide which.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Version,
         [Parameter(Mandatory)][string]$Package,
+        [Parameter(Mandatory)][ValidateSet('stable', 'beta')][string]$Channel,
 
-        # Versions of this package kept in the pool. Two is the minimum that
-        # leaves a site somewhere to go back to: apt can only downgrade to a
-        # version the pool still carries.
-        [int]$Keep = 2,
+        # Versions of this package this channel keeps in the pool. Defaults per
+        # channel: see $script:ChannelKeep.
+        [int]$Keep,
 
         [switch]$Push
     )
 
     Assert-CleanMain
     Assert-ReleaseAssets -Package $Package -Version $Version
+    if (-not $PSBoundParameters.ContainsKey('Keep')) { $Keep = $script:ChannelKeep[$Channel] }
 
-    $entries = Read-ChannelFile
+    $entries = Read-ChannelFile -Channel $Channel
     if ($entries | Where-Object { $_.Package -eq $Package -and $_.Version -eq $Version }) {
-        throw "$Package $Version is already on the channel"
+        throw "$Package $Version is already on $Channel"
     }
 
     $existing = @($entries | Where-Object Package -EQ $Package)
@@ -145,22 +181,25 @@ function New-AptPromotion {
         [pscustomobject]@{ Package = $Package; Version = $Version }
         $existing
     ) | Select-Object -First $Keep
-    $dropped = @($entries | Where-Object Package -EQ $Package | Where-Object {
-            $_.Version -notin $promoted.Version
-        }).Version
+    $dropped = @($existing | Where-Object { $_.Version -notin $promoted.Version }).Version
     $updated = @($promoted) + @($entries | Where-Object Package -NE $Package)
 
-    Write-Host "==> promoting $Package $Version" -ForegroundColor Cyan
-    Write-Host "    channel becomes: $(($promoted | ForEach-Object { $_.Version }) -join ', ')"
-    if ($dropped) { Write-Host "    leaving the pool: $($dropped -join ', ')" -ForegroundColor DarkGray }
+    Write-Host "==> promoting $Package $Version to $Channel" -ForegroundColor Cyan
+    Write-Host "    $Channel becomes: $(($promoted | ForEach-Object { $_.Version }) -join ', ')"
+    if ($dropped) { Write-Host "    leaving $Channel : $($dropped -join ', ')" -ForegroundColor DarkGray }
 
-    $target = "promote/$Package-$Version"
-    if (-not $PSCmdlet.ShouldProcess($script:ChannelFile, "promote $Package $Version on branch $target")) {
+    $target = "promote/$Channel-$Package-$Version"
+    if (-not $PSCmdlet.ShouldProcess((Get-ChannelFile -Channel $Channel),
+            "promote $Package $Version to $Channel on branch $target")) {
         return
     }
 
-    $subject = "feat: promove $Package $Version para o canal stable"
-    $body = if ($existing) {
+    $subject = "feat: promove $Package $Version para o canal $Channel"
+    $body = if ($Channel -eq 'beta') {
+        "Sites inscritos no beta passam a receber $Package $Version por ``apt upgrade``. " +
+        "O canal stable não muda."
+    }
+    elseif ($existing) {
         "Sites em Debian 13 passam a receber $Package $Version por ``apt upgrade``."
     }
     else {
@@ -169,14 +208,83 @@ function New-AptPromotion {
         "Primeira versão de $Package no canal. Sites em Debian 13 passam a " +
         "poder instalá-lo com ``apt install $Package``."
     }
+    if ($dropped) { $body += "`n`nSai do $Channel : $($dropped -join ', ')." }
+    Submit-ChannelChange -Manifests @{ $Channel = $updated } -Branch $target `
+        -Subject $subject -Body $body -Push:$Push
+}
+
+function Move-AptPromotion {
+    <#
+    .SYNOPSIS
+        Moves a version that has soaked on beta over to stable, without
+        downloading anything: the .deb is already in the pool.
+
+    .DESCRIPTION
+        The normal end of a candidate's life. It leaves beta as it joins stable,
+        because canaries subscribe to both suites and keep receiving it from
+        stable — leaving it on both would only pin a second copy in the pool for
+        no one's benefit.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$Package,
+        [ValidateSet('stable', 'beta')][string]$From = 'beta',
+        [ValidateSet('stable', 'beta')][string]$To = 'stable',
+        [int]$Keep,
+        [switch]$Push
+    )
+
+    Assert-CleanMain
+    if ($From -eq $To) { throw "-From and -To are both '$From'" }
+    if (-not $PSBoundParameters.ContainsKey('Keep')) { $Keep = $script:ChannelKeep[$To] }
+
+    $source = Read-ChannelFile -Channel $From
+    if (-not ($source | Where-Object { $_.Package -eq $Package -and $_.Version -eq $Version })) {
+        throw "$Package $Version is not on $From"
+    }
+    $destination = Read-ChannelFile -Channel $To
+    if ($destination | Where-Object { $_.Package -eq $Package -and $_.Version -eq $Version }) {
+        throw "$Package $Version is already on $To"
+    }
+
+    $existing = @($destination | Where-Object Package -EQ $Package)
+    $promoted = @(
+        [pscustomobject]@{ Package = $Package; Version = $Version }
+        $existing
+    ) | Select-Object -First $Keep
+    $dropped = @($existing | Where-Object { $_.Version -notin $promoted.Version }).Version
+
+    $sourceUpdated = @($source | Where-Object {
+            -not ($_.Package -eq $Package -and $_.Version -eq $Version)
+        })
+    $destinationUpdated = @($promoted) + @($destination | Where-Object Package -NE $Package)
+
+    Write-Host "==> moving $Package $Version from $From to $To" -ForegroundColor Cyan
+    Write-Host "    $To becomes: $(($promoted | ForEach-Object { $_.Version }) -join ', ')"
+    $left = @($sourceUpdated | Where-Object Package -EQ $Package).Version
+    Write-Host "    $From becomes: $(if ($left) { $left -join ', ' } else { '(empty for this package)' })"
+    if ($dropped) { Write-Host "    leaving the pool: $($dropped -join ', ')" -ForegroundColor DarkGray }
+
+    $target = "promote/$To-$Package-$Version"
+    if (-not $PSCmdlet.ShouldProcess((Get-ChannelFile -Channel $To),
+            "move $Package $Version from $From to $To on branch $target")) {
+        return
+    }
+
+    $subject = "feat: $Package $Version sai do $From para o $To"
+    $body = "Soube-se o bastante no $From. Todos os sites em Debian 13 passam a " +
+    "receber $Package $Version por ``apt upgrade``; o .deb já está no pool, " +
+    "então nada novo sobe."
     if ($dropped) { $body += "`n`nSai do pool: $($dropped -join ', ')." }
-    Submit-ChannelChange -Entries $updated -Branch $target -Subject $subject -Body $body -Push:$Push
+    Submit-ChannelChange -Manifests @{ $From = $sourceUpdated; $To = $destinationUpdated } `
+        -Branch $target -Subject $subject -Body $body -Push:$Push
 }
 
 function Remove-AptPromotion {
     <#
     .SYNOPSIS
-        Takes a version off the channel, leaving the pool serving the previous one.
+        Takes a version off a channel, leaving it serving the previous one.
 
     .DESCRIPTION
         The rollback counterpart of New-AptPromotion. Reverting the promotion
@@ -188,35 +296,48 @@ function Remove-AptPromotion {
     param(
         [Parameter(Mandatory)][string]$Version,
         [Parameter(Mandatory)][string]$Package,
+        [Parameter(Mandatory)][ValidateSet('stable', 'beta')][string]$Channel,
         [switch]$Push
     )
 
     Assert-CleanMain
 
-    $entries = Read-ChannelFile
+    $entries = Read-ChannelFile -Channel $Channel
     if (-not ($entries | Where-Object { $_.Package -eq $Package -and $_.Version -eq $Version })) {
-        throw "$Package $Version is not on the channel"
+        throw "$Package $Version is not on $Channel"
     }
 
     $updated = @($entries | Where-Object { -not ($_.Package -eq $Package -and $_.Version -eq $Version) })
     $remaining = @($updated | Where-Object Package -EQ $Package).Version
-    # An empty channel is worse than a bad version: `apt install` stops
-    # resolving at all, including on machines that never took the bad one.
-    if (-not $remaining) { throw "that is the only $Package version on the channel; promote a replacement first" }
+    # Emptying stable is worse than a bad version: `apt install` stops resolving
+    # at all, including on machines that never took the bad one. beta may drain,
+    # since a canary subscribes to stable as well and falls through to it.
+    if (-not $remaining -and $Channel -in $script:RequiredChannels) {
+        throw "that is the only $Package version on $Channel; promote a replacement first"
+    }
 
-    Write-Host "==> withdrawing $Package $Version" -ForegroundColor Cyan
-    Write-Host "    channel becomes: $($remaining -join ', ')"
+    Write-Host "==> withdrawing $Package $Version from $Channel" -ForegroundColor Cyan
+    Write-Host "    $Channel becomes: $(if ($remaining) { $remaining -join ', ' } else { '(empty for this package)' })"
 
-    $target = "withdraw/$Package-$Version"
-    if (-not $PSCmdlet.ShouldProcess($script:ChannelFile, "withdraw $Package $Version on branch $target")) {
+    $target = "withdraw/$Channel-$Package-$Version"
+    if (-not $PSCmdlet.ShouldProcess((Get-ChannelFile -Channel $Channel),
+            "withdraw $Package $Version from $Channel on branch $target")) {
         return
     }
 
-    $fallback = ($remaining | Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } })[0]
-    $subject = "revert: retira $Package $Version do canal stable"
-    $body = "O canal volta a servir $Package $fallback. " +
-    "Sites que já atualizaram voltam com ``apt install $Package=$fallback``."
-    Submit-ChannelChange -Entries $updated -Branch $target -Subject $subject -Body $body -Push:$Push
+    $subject = "revert: retira $Package $Version do canal $Channel"
+    $body = if ($remaining) {
+        $fallback = ($remaining | Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } })[0]
+        "O canal volta a servir $Package $fallback. " +
+        "Sites que já atualizaram voltam com ``apt install $Package=$fallback``."
+    }
+    else {
+        # Only reachable on beta: stable is guarded above.
+        "O $Channel fica sem $Package. Os canários voltam ao que o stable serve, " +
+        "com ``apt install $Package=<versão do stable>``."
+    }
+    Submit-ChannelChange -Manifests @{ $Channel = $updated } -Branch $target `
+        -Subject $subject -Body $body -Push:$Push
 }
 
 function Test-AptChannel {
@@ -229,9 +350,22 @@ function Test-AptChannel {
     param([string]$Url = $script:ChannelUrl)
 
     $healthy = $true
+    foreach ($suite in $script:Channels) {
+        if (-not (Test-AptSuite -Url $Url -Suite $suite)) { $healthy = $false }
+    }
+    return $healthy
+}
 
-    $inRelease = Get-TextResource "$Url/dists/$($script:Suite)/InRelease"
-    Write-Host "==> $Url ($($script:Suite))" -ForegroundColor Cyan
+function Test-AptSuite {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Suite
+    )
+
+    $healthy = $true
+
+    $inRelease = Get-TextResource "$Url/dists/$Suite/InRelease"
+    Write-Host "==> $Url ($Suite)" -ForegroundColor Cyan
 
     # Age is the early signal. Valid-Until only trips once re-signing has been
     # broken for most of the window, by which point the schedule has usually
@@ -252,13 +386,13 @@ function Test-AptChannel {
     $colour = if ($remaining -lt 14) { 'Red' } else { 'DarkGray' }
     Write-Host "    valid until: $validUntil ($([math]::Round($remaining, 1)) days)" -ForegroundColor $colour
     if ($remaining -lt 14) {
-        Write-Warning "index expires in under two weeks — publish now or apt update starts failing everywhere."
+        Write-Warning "$Suite expires in under two weeks — publish now or apt update starts failing everywhere."
         $healthy = $false
     }
 
-    $promoted = Read-ChannelFile
+    $promoted = Read-ChannelFile -Channel $Suite
     foreach ($arch in $script:Architectures) {
-        $packages = Get-TextResource "$Url/dists/$($script:Suite)/main/binary-$arch/Packages"
+        $packages = Get-TextResource "$Url/dists/$Suite/main/binary-$arch/Packages"
         $served = @($packages -split '\r?\n\r?\n' | Where-Object { $_.Trim() } | ForEach-Object {
                 [pscustomobject]@{
                     Package = Read-ReleaseField $_ 'Package'
@@ -270,7 +404,7 @@ function Test-AptChannel {
         foreach ($entry in $promoted) {
             $match = $served | Where-Object { $_.Package -eq $entry.Package -and $_.Version -eq $entry.Version }
             if (-not $match) {
-                Write-Warning "$($entry.Package) $($entry.Version) is in stable.list but absent from $arch — publish not run since the last promotion?"
+                Write-Warning "$($entry.Package) $($entry.Version) is in $Suite.list but absent from $Suite/$arch — publish not run since the last promotion?"
                 $healthy = $false
             }
         }
@@ -289,7 +423,9 @@ function Assert-CleanMain {
 
 function Submit-ChannelChange {
     param(
-        [Parameter(Mandatory)][pscustomobject[]]$Entries,
+        # Channel name -> the entries that channel's manifest should end up
+        # holding. A move writes two; everything else writes one.
+        [Parameter(Mandatory)][hashtable]$Manifests,
         [Parameter(Mandatory)][string]$Branch,
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
@@ -301,10 +437,14 @@ function Submit-ChannelChange {
     git -C $script:RepoRoot switch --create $Branch --no-track
     if ($LASTEXITCODE -ne 0) { throw "git switch failed" }
 
-    Write-ChannelFile -Entries $Entries
-    Sync-Pool -Entries $Entries
-    # --all so the withdrawn version's .deb files are staged as deletions.
-    git -C $script:RepoRoot add --all stable.list pool
+    foreach ($channel in $Manifests.Keys) {
+        Write-ChannelFile -Channel $channel -Entries @($Manifests[$channel])
+    }
+    # After every manifest is written, never per channel: the pool is shared, so
+    # a sync run against one channel's entries alone would delete the other's.
+    Sync-Pool
+    # --all so a withdrawn version's .deb files are staged as deletions.
+    git -C $script:RepoRoot add --all $script:Channels.ForEach({ "$_.list" }) pool
     if ($LASTEXITCODE -ne 0) { throw "git add failed" }
 
     git -C $script:RepoRoot commit -m $Subject -m $Body
@@ -361,12 +501,20 @@ function Get-ReleaseTag {
 function Sync-Pool {
     <#
     .SYNOPSIS
-        Makes the committed pool hold exactly the .deb files the manifest names.
+        Makes the committed pool hold exactly the .deb files the channels name,
+        across all of them.
+
+    .DESCRIPTION
+        It reads the manifests itself rather than taking entries, because the
+        pool is shared between the channels: handed one channel's entries it
+        would delete every .deb only the other names.
     #>
-    param([Parameter(Mandatory)][pscustomobject[]]$Entries)
+    param()
+
+    $entries = @($script:Channels | ForEach-Object { Read-ChannelFile -Channel $_ })
 
     $wanted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($entry in $Entries) {
+    foreach ($entry in $entries) {
         $dir = Get-PoolPath -Package $entry.Package
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         foreach ($arch in $script:Architectures) {
@@ -391,22 +539,38 @@ function Sync-Pool {
     }
 }
 
+function Get-ChannelFile {
+    param([Parameter(Mandatory)][string]$Channel)
+
+    if ($Channel -notin $script:Channels) {
+        throw "unknown channel '$Channel' (known: $($script:Channels -join ', '))"
+    }
+    Join-Path $script:RepoRoot "$Channel.list"
+}
+
 function Read-ChannelFile {
-    $entries = foreach ($line in Get-Content -LiteralPath $script:ChannelFile) {
+    param([Parameter(Mandatory)][string]$Channel)
+
+    $file = Get-ChannelFile -Channel $Channel
+    $entries = foreach ($line in Get-Content -LiteralPath $file) {
         $stripped = ($line -replace '#.*', '').Trim()
         if (-not $stripped) { continue }
         $parts = $stripped -split '\s+'
-        if ($parts.Count -ne 2) { throw "malformed stable.list entry: '$line'" }
+        if ($parts.Count -ne 2) { throw "malformed $Channel.list entry: '$line'" }
         [pscustomobject]@{ Package = $parts[0]; Version = $parts[1] }
     }
     return @($entries)
 }
 
 function Write-ChannelFile {
-    param([Parameter(Mandatory)][pscustomobject[]]$Entries)
+    param(
+        [Parameter(Mandatory)][string]$Channel,
+        [AllowEmptyCollection()][pscustomobject[]]$Entries = @()
+    )
 
+    $file = Get-ChannelFile -Channel $Channel
     $header = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in Get-Content -LiteralPath $script:ChannelFile) {
+    foreach ($line in Get-Content -LiteralPath $file) {
         if (($line -replace '#.*', '').Trim()) { break }
         $header.Add($line.TrimEnd())
     }
@@ -418,7 +582,7 @@ function Write-ChannelFile {
     # LF explicitly: the publish workflow reads this file line by line, and a
     # trailing CR would ride along inside the version into the release tag it
     # builds from it.
-    [System.IO.File]::WriteAllText($script:ChannelFile, ($lines -join "`n") + "`n")
+    [System.IO.File]::WriteAllText($file, ($lines -join "`n") + "`n")
 }
 
 function Assert-ReleaseAssets {
@@ -496,4 +660,4 @@ function ConvertTo-SortableVersion {
 }
 
 Export-ModuleMember -Function Get-AptChannel, Save-AptCandidate, New-AptPromotion,
-Remove-AptPromotion, Test-AptChannel, Get-ReleaseTag
+Move-AptPromotion, Remove-AptPromotion, Test-AptChannel, Get-ReleaseTag

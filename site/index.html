@@ -82,6 +82,19 @@ sudo apt install skbridge skprinter</code></pre>
 <p>Install only what the appliance needs; the two are independent and coexist.
 Every later upgrade is <code>sudo apt upgrade</code>.</p>
 
+<h2>Beta</h2>
+<p>New versions land on a <code>beta</code> suite first and stay there until they
+have proven themselves. To let a site take them early, add it alongside
+<code>stable</code> &mdash; not instead of it, since beta is empty between
+candidates:</p>
+<pre><code>sudo sed -i 's/^Suites: stable$/Suites: stable beta/' \
+  /etc/apt/sources.list.d/skymob.sources
+sudo apt update &amp;&amp; sudo apt upgrade</code></pre>
+
+<p>Reverse the edit to leave. apt will not downgrade on its own, so a machine
+already carrying a beta version goes back with
+<code>sudo apt install &lt;package&gt;=&lt;version&gt; --allow-downgrades</code>.</p>
+
 <h2>Signing key</h2>
 <p><a href="skymob.asc">skymob.asc</a> &mdash; verify with
 <code>gpg --show-keys</code> before trusting it:</p>

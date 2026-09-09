@@ -54,7 +54,8 @@ sudo apt install ./skbridge_<version>_amd64.deb ./skprinter_<version>_amd64.deb
 Install both in **one** `apt install`, the way the appliance gets them.
 
 **After publishing** — the channel itself, which also proves the signature and
-the `Valid-Until` stamp:
+the `Valid-Until` stamp. Use `Suites: stable beta` if you are testing a version
+that is still on beta, and plain `stable` otherwise:
 
 ```bash
 sudo apt install -y curl
@@ -135,7 +136,39 @@ The console is bundled at build time, and a missing bundle is silent otherwise.
 
 ---
 
-## 5. Upgrade and rollback
+## 5. The canary path
+
+Only for a version sitting on beta. Restore the `clean` snapshot, install from
+the channel with `Suites: stable`, then opt in and confirm the site actually
+moves:
+
+```bash
+apt-cache policy skbridge          # candidate = the stable version
+sudo sed -i 's/^Suites: stable$/Suites: stable beta/' /etc/apt/sources.list.d/skymob.sources
+sudo apt update
+apt-cache policy skbridge          # candidate = the beta version, from beta/main
+sudo apt upgrade
+```
+
+The version table must show both suites as sources, with the beta one winning.
+If beta does not appear at all, the publish has not run since the promotion —
+`Test-AptChannel` says so from your own machine.
+
+Then confirm the way back, which is the part a site will actually need:
+
+```bash
+sudo sed -i 's/^Suites: stable beta$/Suites: stable/' /etc/apt/sources.list.d/skymob.sources
+sudo apt update
+sudo apt install skbridge=<stable version> --allow-downgrades
+```
+
+`--allow-downgrades` is required and is not a sign anything is wrong: apt never
+steps a package backwards on its own, which is exactly why leaving the canary
+group does not undo the upgrade by itself.
+
+---
+
+## 6. Upgrade and rollback
 
 The path every existing site takes, and the one most worth proving. Restore the
 `clean` snapshot first.
@@ -168,7 +201,7 @@ An upgrade that reseeds `settings.json` over an operator's edits is a bug —
 
 ---
 
-## 6. Removal
+## 7. Removal
 
 ```bash
 sudo apt remove skprinter && ls /var/lib/skprinter     # state kept
@@ -180,7 +213,7 @@ Then restore the `clean` snapshot.
 
 ---
 
-## 7. If you are testing a printer
+## 8. If you are testing a printer
 
 With a Zebra reachable on the LAN, point an entry at it and print:
 
@@ -207,12 +240,13 @@ shared with the Windows build — see `SKPrinter.Appliance/pkg/README.md` in
 
 ---
 
-## 8. After the publish workflow runs
+## 9. After the publish workflow runs
 
 ```powershell
 Test-AptChannel
 ```
 
-Reports how long ago the index was signed, how long it stays valid, and whether
-every version `stable.list` names is actually served on both architectures.
-Returns `$true` when all of that holds.
+Reports, for each suite, how long ago its index was signed, how long it stays
+valid, and whether every version that suite's manifest names is actually served
+on both architectures. Returns `$true` only when all of that holds for both —
+a lapsed beta breaks `apt update` on the canaries even though stable is fine.

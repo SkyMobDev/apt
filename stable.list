@@ -1,10 +1,16 @@
-# Packages published to https://apt.skymob.app — this file IS the promotion
-# decision. Only what is named here is published, so cutting a release upstream
-# never reaches customers on its own.
+# Packages published to the stable suite of https://apt.skymob.app — this file
+# IS the promotion decision, and it is what every site gets by default. Only
+# what is named here is published, so cutting a release upstream never reaches
+# customers on its own.
 #
-# Edit it with New-AptPromotion / Remove-AptPromotion (Promote.psm1), not by
-# hand: the matching .deb files under pool/ have to move with it, and the
-# publish workflow refuses a commit where the two disagree.
+# beta.list is the same thing for the canary suite. The two share one pool: a
+# version normally lands on beta, soaks there, and is then moved here by
+# Move-AptPromotion, which needs no new download.
+#
+# Edit it with New-AptPromotion -Channel stable / Move-AptPromotion /
+# Remove-AptPromotion -Channel stable (Promote.psm1), not by hand: the matching
+# .deb files under pool/ have to move with it, and the publish workflow refuses
+# a commit where the manifests and the pool disagree.
 #
 # Format: "<package> <version>", one per line. <version> must match a release
 # tag in SkyMobDev/iot-edge — but the tag is named for the project that builds

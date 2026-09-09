@@ -40,6 +40,34 @@ labels; the two are independent and coexist. The architecture is left out on
 purpose: apt fetches the index matching the machine's own dpkg architecture.
 Every later upgrade is `sudo apt upgrade`.
 
+### Making a site a canary
+
+A new version normally lands on the **beta** suite first and stays there until
+it has proven itself on a few sites. Nothing else sees it. A site opts in by
+adding `beta` to the suites it subscribes to:
+
+```bash
+sudo sed -i 's/^Suites: stable$/Suites: stable beta/' \
+  /etc/apt/sources.list.d/skymob.sources
+sudo apt update && sudo apt upgrade
+```
+
+Keep `stable` in the list. apt installs the highest version across every suite a
+site subscribes to, so listing both means the site takes a beta version while one
+exists and falls back to stable the rest of the time. Dropping `stable` would
+instead leave it with only whatever beta happens to hold, which is usually
+nothing.
+
+Leaving the canary group is the same edit reversed. That does **not** uninstall
+the beta version already on the machine — apt does not downgrade on its own:
+
+```bash
+sudo apt install skbridge=<stable version> --allow-downgrades
+```
+
+The version has to be one the pool still carries, which is what `stable.list`
+keeping two of each is for.
+
 ## Signing key
 
 ```
@@ -91,24 +119,37 @@ appliance needs its `/etc/apt/keyrings/skymob.asc` replaced by hand before
 ## Promoting a release
 
 Cutting a release upstream publishes nothing here. What reaches customers is
-exactly what [`stable.list`](stable.list) names, so promotion is a deliberate,
-reviewed edit. [`Promote.psm1`](Promote.psm1) drives it — it needs PowerShell 7
-and a `gh` authenticated with read access to `iot-edge`:
+exactly what [`stable.list`](stable.list) and [`beta.list`](beta.list) name, so
+promotion is a deliberate, reviewed edit. [`Promote.psm1`](Promote.psm1) drives
+it — it needs PowerShell 7 and a `gh` authenticated with read access to
+`iot-edge`:
 
 ```powershell
 Import-Module .\Promote.psm1 -Force
 
-Get-AptChannel                                          # every package: published vs. upstream
-Save-AptCandidate -Package skbridge -Version 0.1.41     # pull the .deb for a test VM
-New-AptPromotion  -Package skbridge -Version 0.1.41 -Push   # branch + commit + pull request
-Test-AptChannel                                         # after the merge: what the channel serves
+Get-AptChannel                                     # every package: which channel, vs. upstream
+Save-AptCandidate -Package skbridge -Version 0.2.0 # pull the .deb for a test VM
+
+New-AptPromotion  -Package skbridge -Version 0.2.0 -Channel beta -Push
+#   canaries take it; leave it to soak
+
+Move-AptPromotion -Package skbridge -Version 0.2.0 -Push   # beta -> stable
+Test-AptChannel                                    # after the merge: what the channels serve
 ```
 
-`-Package` is required rather than defaulted: with more than one package on the
-channel, a forgotten flag would promote the wrong thing silently.
-[`SMOKE-TEST.md`](SMOKE-TEST.md) is the manual check to run on a VM between
-`Save-AptCandidate` and `New-AptPromotion` — CI can install these packages but
-never starts them, so nothing automated has seen the services run.
+`Move-AptPromotion` downloads nothing: the `.deb` is already in the pool from
+the beta promotion, so going to stable is a manifest edit and no new bytes. It
+takes the version off beta as it joins stable, because canaries subscribe to
+both and keep receiving it from stable.
+
+Going straight to stable is `New-AptPromotion -Channel stable`. Skipping the
+soak is a decision, not the default.
+
+`-Package` and `-Channel` are required rather than defaulted: the channels reach
+very different numbers of machines, and a flag you can forget should not be what
+decides which. [`SMOKE-TEST.md`](SMOKE-TEST.md) is the manual check to run on a
+VM between `Save-AptCandidate` and `New-AptPromotion` — CI can install these
+packages but never starts them, so nothing automated has seen the services run.
 
 `New-AptPromotion` downloads both architectures' `.deb` with **your** GitHub
 access and commits them next to the manifest edit, so the pull request shows
@@ -121,26 +162,38 @@ That download is the only crossing from private to public, and a person makes
 it. CI holds no credential for `iot-edge` and cannot reach it.
 
 Rolling a bad version back is `Remove-AptPromotion -Package <pkg> -Version <bad>
--Push`. It edits the manifest as it stands rather than reverting the promotion
-commit, which stops working as soon as a later promotion has touched the same
-file. The pool is rebuilt without that version, and machines that took it return
-with `apt install <pkg>=<previous>` — which is why the manifest keeps two.
+-Channel <channel> -Push`. It edits the manifest as it stands rather than
+reverting the promotion commit, which stops working as soon as a later promotion
+has touched the same file. The pool is rebuilt without that version, and machines
+that took it return with `apt install <pkg>=<previous>` — which is why stable
+keeps two of each.
+
+Withdrawing from beta may leave it empty. That is a normal state, not a
+breakage: canaries fall back to stable and apt reads an empty suite without
+complaint. `stable` is the one that may never empty out, so the same call is
+refused there when it would remove a package's last version.
 
 ## How this repository is published
 
 `.github/workflows/publish.yml` rebuilds the whole index on each run:
 
-1. checks the committed `pool/` holds exactly the `.deb` files `stable.list`
-   names — no more, no fewer,
-2. generates `Packages`/`Release` with `apt-ftparchive` and stamps a 90-day
-   `Valid-Until`,
-3. clear-signs `InRelease` and detach-signs `Release.gpg`,
-4. installs every package `stable.list` names inside a `debian:13-slim`
-   container, through apt itself and in a single call, before publishing,
+1. checks the committed `pool/` holds exactly the `.deb` files the manifests
+   name between them — no more, no fewer,
+2. generates one `Packages`/`Release` tree per suite over that shared pool, and
+   stamps each with a 90-day `Valid-Until`,
+3. clear-signs `InRelease` and detach-signs `Release.gpg`, for both suites,
+4. installs every package inside a `debian:13-slim` container through apt
+   itself — once as an ordinary site on stable, once as a canary on stable and
+   beta together — before publishing,
 5. deploys the tree to GitHub Pages.
 
 Consequences worth knowing before changing anything here:
 
+- **One pool, two suites.** `dists/stable` and `dists/beta` are separate
+  indices over the same `pool/`, so a version that appears on both is stored
+  once. It also means anything that prunes the pool has to consider both
+  manifests at once — `Sync-Pool` reads them itself rather than taking entries,
+  precisely so it cannot be handed half the picture.
 - **`pool/` is committed, `dists/` is not.** Committing the packages is what
   removes the need for any cross-repository credential in CI. The cost is that
   each promoted version leaves its packages in git history permanently, even
