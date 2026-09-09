@@ -135,9 +135,16 @@ jobs:
         # Runs against the exact tree that deploys, on the distro we support,
         # through apt itself: a bad signature, a missing arch index or an
         # unsatisfiable dependency fails here instead of on the appliances.
+        #
+        # Every package stable.list names, installed in one apt call rather than
+        # one at a time. These packages share an appliance, and a path two of
+        # them both ship only collides when dpkg unpacks the second.
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/_site:/site:ro" debian:13-slim bash -eux -c '
+          packages=$(sed 's/#.*//; s/\r$//' stable.list | awk 'NF { print $1 }' | sort -u)
+          echo "verifying: $(echo $packages)"
+          docker run --rm -v "$PWD/_site:/site:ro" -e PACKAGES="$packages" \
+            debian:13-slim bash -eux -c '
             install -d /etc/apt/keyrings
             cp /site/skymob.asc /etc/apt/keyrings/skymob.asc
             printf "%s\n" \
@@ -148,8 +155,13 @@ jobs:
               "Signed-By: /etc/apt/keyrings/skymob.asc" \
               > /etc/apt/sources.list.d/skymob.sources
             apt-get update
-            apt-cache policy skbridge
-            apt-get install -y --download-only skbridge
+            for pkg in $PACKAGES; do apt-cache policy "$pkg"; done
+            # A real install, not --download-only: unpacking is what proves the
+            # maintainer scripts run, the files land, and no two packages fight
+            # over a path. systemd is not running here, so the units are
+            # registered but never started — that part is the VM check.
+            apt-get install -y $PACKAGES
+            dpkg -l $PACKAGES
           '
 
       - uses: actions/upload-pages-artifact@v5

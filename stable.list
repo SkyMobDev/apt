@@ -6,8 +6,11 @@
 # hand: the matching .deb files under pool/ have to move with it, and the
 # publish workflow refuses a commit where the two disagree.
 #
-# Format: "<package> <version>", one per line. <version> must match a
-# <package>-v<version> release tag in SkyMobDev/iot-edge.
+# Format: "<package> <version>", one per line. <version> must match a release
+# tag in SkyMobDev/iot-edge — but the tag is named for the project that builds
+# the package, not for the package. skprinter comes from skprinter-appliance-v*
+# (skprinter-v* is the Windows build, which ships no .deb). Promote.psm1 holds
+# the mapping; that is the only place the two names meet.
 #
 # Keep the previous version listed too: apt installs the newest by default,
 # and the older one in the pool is what makes `apt install skbridge=<old>`

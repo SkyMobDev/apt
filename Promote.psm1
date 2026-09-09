@@ -23,12 +23,13 @@
 .EXAMPLE
     Import-Module .\Promote.psm1 -Force
 
-    Get-AptChannel                             # published vs. available upstream
-    Save-AptCandidate   -Version 0.1.27        # download the .deb to test with
-    New-AptPromotion    -Version 0.1.27        # branch + commit the manifest edit
-    New-AptPromotion    -Version 0.1.27 -Push  # ...and push it and open the PR
-    Test-AptChannel                            # what the live channel serves
-    Remove-AptPromotion -Version 0.1.27 -Push  # roll it back off the channel
+    Get-AptChannel                                  # every package: published vs. upstream
+    Get-AptChannel      -Package skprinter          # just the one
+    Save-AptCandidate   -Package skbridge -Version 0.1.41        # .deb to test with
+    New-AptPromotion    -Package skbridge -Version 0.1.41        # branch + commit
+    New-AptPromotion    -Package skbridge -Version 0.1.41 -Push  # ...and open the PR
+    Test-AptChannel                                 # what the live channel serves
+    Remove-AptPromotion -Package skbridge -Version 0.1.41 -Push  # roll it back off
 #>
 
 $script:RepoRoot      = $PSScriptRoot
@@ -38,6 +39,17 @@ $script:ChannelUrl    = 'https://apt.skymob.app'
 $script:Suite         = 'stable'
 $script:Architectures = @('amd64', 'arm64')
 
+# Upstream tags are named for the project that builds them, which is not always
+# the Debian package that project produces. SKPrinter.Appliance tags as
+# skprinter-appliance and installs as skprinter — and skprinter-v* is a
+# different product, the Windows SKPrinter, whose releases carry no .deb at all.
+# Every lookup that reaches for a release goes through Get-ReleaseTag, so the
+# two names are only related here.
+$script:ReleaseTagPrefix = [ordered]@{
+    skbridge  = 'skbridge'
+    skprinter = 'skprinter-appliance'
+}
+
 # The index is re-signed weekly, so anything older than this means at least one
 # cycle was missed. GitHub neither retries nor backfills a dropped schedule.
 $script:MaxSignedAgeDays = 10
@@ -46,18 +58,24 @@ function Get-AptChannel {
     <#
     .SYNOPSIS
         Lists every upstream release of a package and whether it is published.
+        With no -Package, reports on every package the channel knows about.
     #>
     [CmdletBinding()]
-    param([string]$Package = 'skbridge')
+    param([string]$Package)
 
+    if (-not $Package) {
+        return @($script:ReleaseTagPrefix.Keys | ForEach-Object { Get-AptChannel -Package $_ })
+    }
+
+    $prefix = Get-ReleaseTagPrefix -Package $Package
     $published = @(Read-ChannelFile | Where-Object Package -EQ $Package).Version
 
     $tags = gh release list --repo $script:Upstream --limit 100 --json tagName `
-        --jq ".[].tagName | select(startswith(`"$Package-v`"))" 2>&1
+        --jq ".[].tagName | select(startswith(`"$prefix-v`"))" 2>&1
     if ($LASTEXITCODE -ne 0) { throw "gh release list failed: $tags" }
 
     @($tags) |
-        ForEach-Object { $_ -replace "^$Package-v", '' } |
+        ForEach-Object { $_ -replace "^$prefix-v", '' } |
         Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } }, @{ Expression = { $_ } } |
         ForEach-Object {
             [pscustomobject]@{
@@ -76,17 +94,18 @@ function Save-AptCandidate {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Version,
-        [string]$Package = 'skbridge',
+        [Parameter(Mandatory)][string]$Package,
         [string]$Path = (Join-Path $script:RepoRoot 'candidates')
     )
 
     Assert-ReleaseAssets -Package $Package -Version $Version
+    $tag = Get-ReleaseTag -Package $Package -Version $Version
 
     $dest = Join-Path $Path "$Package-$Version"
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    gh release download "$Package-v$Version" --repo $script:Upstream `
+    gh release download $tag --repo $script:Upstream `
         --pattern "${Package}_${Version}_*.deb" --dir $dest --clobber 2>&1 | Write-Verbose
-    if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $Package-v$Version" }
+    if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $tag" }
 
     Write-Host "==> $Package $Version" -ForegroundColor Cyan
     Get-ChildItem -LiteralPath $dest -Filter '*.deb' |
@@ -103,7 +122,7 @@ function New-AptPromotion {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Version,
-        [string]$Package = 'skbridge',
+        [Parameter(Mandatory)][string]$Package,
 
         # Versions of this package kept in the pool. Two is the minimum that
         # leaves a site somewhere to go back to: apt can only downgrade to a
@@ -121,9 +140,10 @@ function New-AptPromotion {
         throw "$Package $Version is already on the channel"
     }
 
+    $existing = @($entries | Where-Object Package -EQ $Package)
     $promoted = @(
         [pscustomobject]@{ Package = $Package; Version = $Version }
-        $entries | Where-Object Package -EQ $Package
+        $existing
     ) | Select-Object -First $Keep
     $dropped = @($entries | Where-Object Package -EQ $Package | Where-Object {
             $_.Version -notin $promoted.Version
@@ -140,7 +160,15 @@ function New-AptPromotion {
     }
 
     $subject = "feat: promove $Package $Version para o canal stable"
-    $body = "Sites em Debian 13 passam a receber $Package $Version por ``apt upgrade``."
+    $body = if ($existing) {
+        "Sites em Debian 13 passam a receber $Package $Version por ``apt upgrade``."
+    }
+    else {
+        # Nothing to upgrade from on the first promotion: the package only
+        # becomes installable once this is published.
+        "Primeira versão de $Package no canal. Sites em Debian 13 passam a " +
+        "poder instalá-lo com ``apt install $Package``."
+    }
     if ($dropped) { $body += "`n`nSai do pool: $($dropped -join ', ')." }
     Submit-ChannelChange -Entries $updated -Branch $target -Subject $subject -Body $body -Push:$Push
 }
@@ -159,7 +187,7 @@ function Remove-AptPromotion {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Version,
-        [string]$Package = 'skbridge',
+        [Parameter(Mandatory)][string]$Package,
         [switch]$Push
     )
 
@@ -307,6 +335,29 @@ function Get-PoolPath {
     Join-Path $script:RepoRoot "pool/main/$($Package.Substring(0, 1))/$Package"
 }
 
+function Get-ReleaseTagPrefix {
+    param([Parameter(Mandatory)][string]$Package)
+
+    $prefix = $script:ReleaseTagPrefix[$Package]
+    # Refusing an unmapped package is the point: guessing the prefix from the
+    # package name is what would send skprinter to the Windows release line.
+    if (-not $prefix) {
+        throw ("unknown package '$Package' — add it to `$script:ReleaseTagPrefix " +
+            "with the tag prefix iot-edge releases it under (known: " +
+            "$($script:ReleaseTagPrefix.Keys -join ', '))")
+    }
+    return $prefix
+}
+
+function Get-ReleaseTag {
+    param(
+        [Parameter(Mandatory)][string]$Package,
+        [Parameter(Mandatory)][string]$Version
+    )
+
+    "$(Get-ReleaseTagPrefix -Package $Package)-v$Version"
+}
+
 function Sync-Pool {
     <#
     .SYNOPSIS
@@ -324,7 +375,8 @@ function Sync-Pool {
             if (Test-Path -LiteralPath (Join-Path $dir $file)) { continue }
 
             Write-Host "    fetching $file" -ForegroundColor DarkGray
-            gh release download "$($entry.Package)-v$($entry.Version)" --repo $script:Upstream `
+            $tag = Get-ReleaseTag -Package $entry.Package -Version $entry.Version
+            gh release download $tag --repo $script:Upstream `
                 --pattern $file --dir $dir --clobber 2>&1 | Write-Verbose
             if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $file" }
         }
@@ -375,7 +427,7 @@ function Assert-ReleaseAssets {
         [Parameter(Mandatory)][string]$Version
     )
 
-    $tag = "$Package-v$Version"
+    $tag = Get-ReleaseTag -Package $Package -Version $Version
     $json = gh release view $tag --repo $script:Upstream --json assets 2>&1
     if ($LASTEXITCODE -ne 0) { throw "release '$tag' not found on $($script:Upstream): $json" }
 
@@ -444,4 +496,4 @@ function ConvertTo-SortableVersion {
 }
 
 Export-ModuleMember -Function Get-AptChannel, Save-AptCandidate, New-AptPromotion,
-Remove-AptPromotion, Test-AptChannel
+Remove-AptPromotion, Test-AptChannel, Get-ReleaseTag
