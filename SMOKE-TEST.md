@@ -42,10 +42,11 @@ from that snapshot than to unpick by hand.
 
 ```powershell
 Import-Module .\Promote.psm1 -Force
-Save-AptCandidate -Package skprinter -Version 0.1.5
+Save-AptCandidate -Package skbridge  -Version <version>
+Save-AptCandidate -Package skprinter -Version <version>
 ```
 
-Copy the amd64 file across (`scp candidates/skprinter-0.1.5/*_amd64.deb …`) and:
+Copy the amd64 files across (`scp candidates/*/*_amd64.deb …`) and:
 
 ```bash
 sudo apt install ./skbridge_<version>_amd64.deb ./skprinter_<version>_amd64.deb
@@ -162,9 +163,10 @@ sudo apt update
 sudo apt install skbridge=<stable version> --allow-downgrades
 ```
 
-`--allow-downgrades` is required and is not a sign anything is wrong: apt never
-steps a package backwards on its own, which is exactly why leaving the canary
-group does not undo the upgrade by itself.
+apt never steps a package backwards on its own, which is why leaving the canary
+group does not undo the upgrade by itself. `--allow-downgrades` is what `-y`
+needs to go through with one; run interactively without `-y`, apt asks
+`Continue? [Y/n]` instead and the flag is unnecessary.
 
 ---
 

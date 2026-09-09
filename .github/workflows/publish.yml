@@ -1,12 +1,13 @@
 name: publish
 
-# Rebuilds the apt index from scratch on every run and deploys it to Pages.
-# Nothing is incremental and nothing is committed: the pool is re-downloaded
-# from the upstream releases each time, so the published repository is
-# reproducible from those releases alone and no .deb ever enters git history.
+# Rebuilds the apt indices from scratch on every run and deploys them to Pages.
+# Nothing here is incremental: the whole of dists/ is regenerated and re-signed
+# each time, over the pool/ this repository carries in git. The .deb files ARE
+# committed, by the person who promoted them — that is what lets this job hold
+# no credential for the private repository they came from.
 on:
-  # Merging a change to stable.list publishes it: the review on that pull
-  # request is the promotion gate, and `git revert` is the rollback.
+  # Merging a change to stable.list or beta.list publishes it: the review on
+  # that pull request is the promotion gate, and `git revert` is the rollback.
   push:
     branches: [main]
   workflow_dispatch:
@@ -15,7 +16,7 @@ on:
   # retries nor backfills a missed occurrence, and it disables schedules after
   # 60 days of repository inactivity — hence a window far longer than the
   # cadence. Runs at :17 because crons on the hour are likelier to be dropped
-  # under load. It re-signs the set stable.list already names, never promotes.
+  # under load. It re-signs the set the manifests already name, never promotes.
   schedule:
     - cron: "17 4 * * 1"
 
@@ -62,6 +63,10 @@ jobs:
           set -euo pipefail
           expected=$(mktemp); actual=$(mktemp)
           for suite in $SUITES; do
+            # Explicitly, because the process substitution below reports a
+            # missing file only on stderr: the loop would read EOF and the
+            # suite would publish empty with this step still green.
+            [ -f "$suite.list" ] || { echo "::error::$suite.list is missing"; exit 1; }
             while read -r pkg version rest; do
               case "$pkg" in '') continue ;; esac
               { [ -n "$version" ] && [ -z "${rest:-}" ]; } ||
@@ -76,12 +81,22 @@ jobs:
           grep -q '[^[:space:]]' < <(sed 's/#.*//' stable.list) ||
             { echo "::error::stable.list names no packages"; exit 1; }
           sort -u -o "$expected" "$expected"
-          find pool -name '*.deb' 2>/dev/null | sort > "$actual"
+          [ -d pool ] || { echo "::error::pool/ is missing"; exit 1; }
+          find pool -name '*.deb' | sort > "$actual"
           if ! diff -u --label "named by the manifests" --label "committed in pool" \
                  "$expected" "$actual"; then
             echo "::error::the committed pool does not match stable.list + beta.list"
             exit 1
           fi
+          # The filename is not the version. apt serves what the control file
+          # says, so a .deb renamed to a version it does not carry would publish
+          # under one number and install as another.
+          while read -r deb; do
+            want_name="${deb##*/}"
+            got="$(dpkg-deb -f "$deb" Package)_$(dpkg-deb -f "$deb" Version)_$(dpkg-deb -f "$deb" Architecture).deb"
+            [ "$got" = "$want_name" ] ||
+              { echo "::error::$deb carries $got"; exit 1; }
+          done < "$actual"
           cat "$actual"
 
       - name: build indices
@@ -92,6 +107,7 @@ jobs:
           set -euo pipefail
           mkdir -p filelists
           for suite in $SUITES; do
+            [ -f "$suite.list" ] || { echo "::error::$suite.list is missing"; exit 1; }
             for arch in $ARCHS; do
               : > "filelists/$suite-$COMPONENT-$arch"
               while read -r pkg version rest; do
@@ -135,8 +151,13 @@ jobs:
               -o APT::FTPArchive::Release::Description="SkyMob edge appliance packages ($suite)" \
               release "dists/$suite" > Release.tmp
             # apt-ftparchive emits no Valid-Until; without one a captured index
-            # can be replayed at a stale version forever.
+            # can be replayed at a stale version forever. sed exits 0 when it
+            # matches nothing, so the anchor is checked rather than assumed.
+            grep -q '^Date: ' Release.tmp ||
+              { echo "::error::no Date: line to anchor Valid-Until to"; exit 1; }
             sed -i "/^Date: /a Valid-Until: $valid" Release.tmp
+            grep -q '^Valid-Until: ' Release.tmp ||
+              { echo "::error::Valid-Until was not written"; exit 1; }
             mv Release.tmp "dists/$suite/Release"
             echo "--- dists/$suite/Release ---"
             cat "dists/$suite/Release"

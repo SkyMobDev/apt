@@ -100,13 +100,18 @@ function Get-AptChannel {
         }
     }
 
-    $tags = gh release list --repo $script:Upstream --limit 100 --json tagName `
-        --jq ".[].tagName | select(startswith(`"$prefix-v`"))" 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "gh release list failed: $tags" }
+    # The limit counts releases of every project in iot-edge, not just this
+    # package's: skbridge, skprinter, skprinter-appliance, skreceiver and
+    # connect all share the tag namespace, so a limit sized for one package
+    # would start dropping published versions off the bottom of this report.
+    # stderr is kept separate; folded in, a gh warning becomes a bogus version.
+    $tags = gh release list --repo $script:Upstream --limit 500 --json tagName `
+        --jq ".[].tagName | select(startswith(`"$prefix-v`"))"
+    if ($LASTEXITCODE -ne 0) { throw "gh release list failed for $script:Upstream" }
 
     @($tags) |
         ForEach-Object { $_ -replace "^$prefix-v", '' } |
-        Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } }, @{ Expression = { $_ } } |
+        Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } } |
         ForEach-Object {
             [pscustomobject]@{
                 Package = $Package
@@ -161,8 +166,9 @@ function New-AptPromotion {
         [Parameter(Mandatory)][ValidateSet('stable', 'beta')][string]$Channel,
 
         # Versions of this package this channel keeps in the pool. Defaults per
-        # channel: see $script:ChannelKeep.
-        [int]$Keep,
+        # channel: see $script:ChannelKeep. One is the floor: a channel that
+        # keeps none of a package is a channel that has just dropped it.
+        [ValidateRange(1, 100)][int]$Keep,
 
         [switch]$Push
     )
@@ -177,16 +183,22 @@ function New-AptPromotion {
     }
 
     $existing = @($entries | Where-Object Package -EQ $Package)
-    $promoted = @(
-        [pscustomobject]@{ Package = $Package; Version = $Version }
-        $existing
-    ) | Select-Object -First $Keep
+    $promoted = Select-KeptVersions -Package $Package -Version $Version -Existing $existing -Keep $Keep
     $dropped = @($existing | Where-Object { $_.Version -notin $promoted.Version }).Version
     $updated = @($promoted) + @($entries | Where-Object Package -NE $Package)
+    Assert-ChannelKeepsPackage -Channel $Channel -Package $Package -Entries $updated
 
     Write-Host "==> promoting $Package $Version to $Channel" -ForegroundColor Cyan
     Write-Host "    $Channel becomes: $(($promoted | ForEach-Object { $_.Version }) -join ', ')"
     if ($dropped) { Write-Host "    leaving $Channel : $($dropped -join ', ')" -ForegroundColor DarkGray }
+
+    # apt serves the highest version a suite carries, so promoting below the top
+    # publishes the .deb without any site moving to it.
+    $isTop = $promoted[0].Version -eq $Version
+    if (-not $isTop) {
+        Write-Warning ("$Channel already carries $Package $($promoted[0].Version), which is higher — " +
+            "no site will move to $Version. It becomes installable by exact version and nothing more.")
+    }
 
     $target = "promote/$Channel-$Package-$Version"
     if (-not $PSCmdlet.ShouldProcess((Get-ChannelFile -Channel $Channel),
@@ -195,7 +207,12 @@ function New-AptPromotion {
     }
 
     $subject = "feat: promove $Package $Version para o canal $Channel"
-    $body = if ($Channel -eq 'beta') {
+    $body = if (-not $isTop) {
+        "O canal $Channel já serve $Package $($promoted[0].Version), que é maior, então nenhum " +
+        "site muda sozinho: $Version fica instalável por versão exata, com " +
+        "``apt install $Package=$Version``."
+    }
+    elseif ($Channel -eq 'beta') {
         "Sites inscritos no beta passam a receber $Package $Version por ``apt upgrade``. " +
         "O canal stable não muda."
     }
@@ -231,7 +248,7 @@ function Move-AptPromotion {
         [Parameter(Mandatory)][string]$Package,
         [ValidateSet('stable', 'beta')][string]$From = 'beta',
         [ValidateSet('stable', 'beta')][string]$To = 'stable',
-        [int]$Keep,
+        [ValidateRange(1, 100)][int]$Keep,
         [switch]$Push
     )
 
@@ -249,16 +266,17 @@ function Move-AptPromotion {
     }
 
     $existing = @($destination | Where-Object Package -EQ $Package)
-    $promoted = @(
-        [pscustomobject]@{ Package = $Package; Version = $Version }
-        $existing
-    ) | Select-Object -First $Keep
+    $promoted = Select-KeptVersions -Package $Package -Version $Version -Existing $existing -Keep $Keep
     $dropped = @($existing | Where-Object { $_.Version -notin $promoted.Version }).Version
 
     $sourceUpdated = @($source | Where-Object {
             -not ($_.Package -eq $Package -and $_.Version -eq $Version)
         })
     $destinationUpdated = @($promoted) + @($destination | Where-Object Package -NE $Package)
+    # Moving out of a required channel is the one direction that can strand a
+    # fleet: it removes the version rather than adding one.
+    Assert-ChannelKeepsPackage -Channel $From -Package $Package -Entries $sourceUpdated
+    Assert-ChannelKeepsPackage -Channel $To -Package $Package -Entries $destinationUpdated
 
     Write-Host "==> moving $Package $Version from $From to $To" -ForegroundColor Cyan
     Write-Host "    $To becomes: $(($promoted | ForEach-Object { $_.Version }) -join ', ')"
@@ -273,9 +291,18 @@ function Move-AptPromotion {
     }
 
     $subject = "feat: $Package $Version sai do $From para o $To"
-    $body = "Soube-se o bastante no $From. Todos os sites em Debian 13 passam a " +
-    "receber $Package $Version por ``apt upgrade``; o .deb já está no pool, " +
-    "então nada novo sobe."
+    $body = if ($To -eq 'stable') {
+        "Soube-se o bastante no $From. Todos os sites em Debian 13 passam a " +
+        "receber $Package $Version por ``apt upgrade``; o .deb já está no pool, " +
+        "então nada novo sobe."
+    }
+    else {
+        # stable -> beta: this takes a version away from the fleet rather than
+        # giving it to them, so say that instead of the promotion sentence.
+        "$Package $Version sai do $From e passa a ser servido só para os canários " +
+        "inscritos no $To. Quem está no $From volta para a versão anterior com " +
+        "``apt install $Package=<anterior>``; o .deb já está no pool, então nada novo sobe."
+    }
     if ($dropped) { $body += "`n`nSai do pool: $($dropped -join ', ')." }
     Submit-ChannelChange -Manifests @{ $From = $sourceUpdated; $To = $destinationUpdated } `
         -Branch $target -Subject $subject -Body $body -Push:$Push
@@ -327,7 +354,7 @@ function Remove-AptPromotion {
 
     $subject = "revert: retira $Package $Version do canal $Channel"
     $body = if ($remaining) {
-        $fallback = ($remaining | Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } })[0]
+        $fallback = @($remaining | Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } })[0]
         "O canal volta a servir $Package $fallback. " +
         "Sites que já atualizaram voltam com ``apt install $Package=$fallback``."
     }
@@ -364,8 +391,15 @@ function Test-AptSuite {
 
     $healthy = $true
 
-    $inRelease = Get-TextResource "$Url/dists/$Suite/InRelease"
     Write-Host "==> $Url ($Suite)" -ForegroundColor Cyan
+    $inRelease = Get-TextResource "$Url/dists/$Suite/InRelease"
+    # A suite the workflow has not deployed yet answers 404, which is the state
+    # between merging a change and the run finishing — and the state of a
+    # brand-new suite until its first publish. That is a report, not a crash.
+    if ($null -eq $inRelease) {
+        Write-Warning "$Suite is not published at $Url — the workflow has not deployed it (yet)."
+        return $false
+    }
 
     # Age is the early signal. Valid-Until only trips once re-signing has been
     # broken for most of the window, by which point the schedule has usually
@@ -432,23 +466,45 @@ function Submit-ChannelChange {
         [switch]$Push
     )
 
+    # Parse every manifest before touching anything. Sync-Pool reads them all,
+    # so a malformed line in the channel this call is not even editing would
+    # otherwise surface halfway through, on a fresh branch, with files already
+    # rewritten.
+    foreach ($channel in $script:Channels) { $null = Read-ChannelFile -Channel $channel }
+
+    $origin = git -C $script:RepoRoot branch --show-current
     # --no-track: main is the base, not the upstream — the branch pushes to its
     # own remote ref.
     git -C $script:RepoRoot switch --create $Branch --no-track
     if ($LASTEXITCODE -ne 0) { throw "git switch failed" }
 
-    foreach ($channel in $Manifests.Keys) {
-        Write-ChannelFile -Channel $channel -Entries @($Manifests[$channel])
-    }
-    # After every manifest is written, never per channel: the pool is shared, so
-    # a sync run against one channel's entries alone would delete the other's.
-    Sync-Pool
-    # --all so a withdrawn version's .deb files are staged as deletions.
-    git -C $script:RepoRoot add --all $script:Channels.ForEach({ "$_.list" }) pool
-    if ($LASTEXITCODE -ne 0) { throw "git add failed" }
+    try {
+        foreach ($channel in $Manifests.Keys) {
+            Write-ChannelFile -Channel $channel -Entries @($Manifests[$channel])
+        }
+        # After every manifest is written, never per channel: the pool is shared,
+        # so a sync run against one channel's entries alone would delete the
+        # other's.
+        Sync-Pool
+        # --all so a withdrawn version's .deb files are staged as deletions.
+        git -C $script:RepoRoot add --all $script:Channels.ForEach({ "$_.list" }) pool
+        if ($LASTEXITCODE -ne 0) { throw "git add failed" }
 
-    git -C $script:RepoRoot commit -m $Subject -m $Body
-    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+        git -C $script:RepoRoot commit -m $Subject -m $Body
+        if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+    }
+    catch {
+        # Assert-CleanMain ran at entry, so everything below is this call's own
+        # work and there is nothing of yours here to lose. Leaving it behind
+        # would strand the next run on "working tree is dirty".
+        Write-Host "Failed; undoing the half-made change" -ForegroundColor Yellow
+        git -C $script:RepoRoot reset --quiet
+        git -C $script:RepoRoot checkout --quiet -- $script:Channels.ForEach({ "$_.list" }) pool
+        git -C $script:RepoRoot clean --quiet -fd -- pool
+        git -C $script:RepoRoot switch --quiet --force $origin
+        git -C $script:RepoRoot branch --quiet -D $Branch
+        throw
+    }
     Write-Host "Committed on $Branch" -ForegroundColor Green
 
     if (-not $Push) {
@@ -513,13 +569,16 @@ function Sync-Pool {
 
     $entries = @($script:Channels | ForEach-Object { Read-ChannelFile -Channel $_ })
 
+    # Full paths, not names: a .deb filed under the wrong package directory is
+    # not the file the index will ask for, so matching on the name alone would
+    # leave it in place and hand CI a pool it then rejects.
     $wanted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in $entries) {
         $dir = Get-PoolPath -Package $entry.Package
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         foreach ($arch in $script:Architectures) {
             $file = "$($entry.Package)_$($entry.Version)_$arch.deb"
-            [void]$wanted.Add($file)
+            [void]$wanted.Add([System.IO.Path]::GetFullPath((Join-Path $dir $file)))
             if (Test-Path -LiteralPath (Join-Path $dir $file)) { continue }
 
             Write-Host "    fetching $file" -ForegroundColor DarkGray
@@ -533,10 +592,63 @@ function Sync-Pool {
     $pool = Join-Path $script:RepoRoot 'pool'
     if (-not (Test-Path -LiteralPath $pool)) { return }
     foreach ($stale in Get-ChildItem -LiteralPath $pool -Filter '*.deb' -Recurse -File) {
-        if ($wanted.Contains($stale.Name)) { continue }
+        if ($wanted.Contains([System.IO.Path]::GetFullPath($stale.FullName))) { continue }
         Write-Host "    removing $($stale.Name)" -ForegroundColor DarkGray
         Remove-Item -LiteralPath $stale.FullName -Force
     }
+}
+
+function Select-KeptVersions {
+    <#
+    .SYNOPSIS
+        The versions a channel holds after adding one: the $Keep highest,
+        newest first.
+
+    .DESCRIPTION
+        Ordered by version rather than by insertion. apt serves the highest
+        version a suite carries, so the one that must survive the window is the
+        highest — taking the first $Keep of an unordered list can drop exactly
+        the version a site would retreat to.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Package,
+        [Parameter(Mandatory)][string]$Version,
+        [AllowEmptyCollection()][pscustomobject[]]$Existing = @(),
+        [Parameter(Mandatory)][int]$Keep
+    )
+
+    @(
+        [pscustomobject]@{ Package = $Package; Version = $Version }
+        $Existing
+    ) |
+        Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_.Version } } |
+        Select-Object -First $Keep
+}
+
+function Assert-ChannelKeepsPackage {
+    <#
+    .SYNOPSIS
+        Refuses an edit that would leave a required channel with no version of
+        a package it already carries.
+
+    .DESCRIPTION
+        Remove-AptPromotion is not the only way to drop the last version: a
+        -Keep too small, or a move out of stable, gets there too. The guard
+        belongs to the outcome, so every mutation runs it against the manifest
+        it is about to write.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Channel,
+        [Parameter(Mandatory)][string]$Package,
+        [AllowEmptyCollection()][pscustomobject[]]$Entries = @()
+    )
+
+    if ($Channel -notin $script:RequiredChannels) { return }
+    if (@($Entries | Where-Object Package -EQ $Package)) { return }
+
+    throw ("that would leave $Channel with no $Package at all, and an empty $Channel stops " +
+        "``apt install $Package`` resolving on every site — including ones that never took " +
+        "the version you are replacing")
 }
 
 function Get-ChannelFile {
@@ -569,16 +681,37 @@ function Write-ChannelFile {
     )
 
     $file = Get-ChannelFile -Channel $Channel
+    $existing = @(Get-Content -LiteralPath $file)
+    $isEntry = { param($line) [bool](($line -replace '#.*', '').Trim()) }
+
     $header = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in Get-Content -LiteralPath $file) {
-        if (($line -replace '#.*', '').Trim()) { break }
+    foreach ($line in $existing) {
+        if (& $isEntry $line) { break }
         $header.Add($line.TrimEnd())
     }
     while ($header.Count -gt 0 -and -not $header[$header.Count - 1]) {
         $header.RemoveAt($header.Count - 1)
     }
 
+    # Anything commented after the last entry is kept as well. Only the entries
+    # are rewritten, so a note someone left at the foot of the file survives
+    # instead of disappearing on the next promotion.
+    $lastEntry = -1
+    for ($i = 0; $i -lt $existing.Count; $i++) { if (& $isEntry $existing[$i]) { $lastEntry = $i } }
+    $footer = [System.Collections.Generic.List[string]]::new()
+    if ($lastEntry -ge 0) {
+        foreach ($line in $existing[($lastEntry + 1)..($existing.Count - 1)]) {
+            if (& $isEntry $line) { continue }
+            $footer.Add($line.TrimEnd())
+        }
+        while ($footer.Count -gt 0 -and -not $footer[0]) { $footer.RemoveAt(0) }
+        while ($footer.Count -gt 0 -and -not $footer[$footer.Count - 1]) {
+            $footer.RemoveAt($footer.Count - 1)
+        }
+    }
+
     $lines = @($header) + @('') + @($Entries | ForEach-Object { "$($_.Package) $($_.Version)" })
+    if ($footer.Count) { $lines += @('') + @($footer) }
     # LF explicitly: the publish workflow reads this file line by line, and a
     # trailing CR would ride along inside the version into the release tag it
     # builds from it.
@@ -607,13 +740,19 @@ function Assert-ReleaseAssets {
 function Get-TextResource {
     <#
     .SYNOPSIS
-        Fetches a repository file as text. Pages serves the index files with a
-        binary content type, for which Invoke-WebRequest yields a byte array
-        rather than a string.
+        Fetches a repository file as text, or $null when it is not there. Pages
+        serves the index files with a binary content type, for which
+        Invoke-WebRequest yields a byte array rather than a string.
     #>
     param([Parameter(Mandatory)][string]$Uri)
 
-    $content = (Invoke-WebRequest $Uri).Content
+    $response = Invoke-WebRequest $Uri -SkipHttpErrorCheck
+    if ($response.StatusCode -eq 404) { return $null }
+    if ($response.StatusCode -ne 200) {
+        throw "GET $Uri returned $($response.StatusCode)"
+    }
+
+    $content = $response.Content
     if ($content -is [byte[]]) {
         return [System.Text.Encoding]::UTF8.GetString($content)
     }
@@ -652,11 +791,35 @@ function Read-ReleaseField {
 }
 
 function ConvertTo-SortableVersion {
+    <#
+    .SYNOPSIS
+        A version rendered as a string that plain descending sort orders the
+        way apt does.
+
+    .DESCRIPTION
+        Never throws. It runs inside Sort-Object expressions, where an
+        exception is not caught by the caller: it prints an error, leaves the
+        item unsorted, and turns terminating under $ErrorActionPreference
+        'Stop' — so an unparseable version would silently mis-order the very
+        list that decides which .deb stays in the pool.
+
+        A prerelease sorts below its own release, which is dpkg's rule for the
+        "1.2.0~rc1" spelling build-deb.sh writes and the reason it rewrites
+        semver's "-" to "~". One key does the whole ordering, so callers cannot
+        pair it with a secondary sort that puts the prerelease back on top.
+
+        Digits only, and fixed width: a separator would put the comparison at
+        the mercy of culture-aware string collation.
+    #>
     param([Parameter(Mandatory)][string]$Version)
 
-    # Sorts on the release part alone; a prerelease suffix would fail the cast,
-    # and the secondary string sort orders those among themselves.
-    [version](($Version -split '-')[0])
+    $release, $suffix = $Version -split '[-~+]', 2
+    $parts = @($release -split '\.' | ForEach-Object { if ($_ -match '^\d+$') { [int]$_ } else { 0 } })
+    while ($parts.Count -lt 4) { $parts += 0 }
+
+    # The flag digit is what puts 1.2.0 above 1.2.0~rc1: same release, 1 vs 0.
+    $isRelease = if ($suffix) { 0 } else { 1 }
+    '{0:D5}{1:D5}{2:D5}{3:D5}{4}{5}' -f $parts[0], $parts[1], $parts[2], $parts[3], $isRelease, $suffix
 }
 
 Export-ModuleMember -Function Get-AptChannel, Save-AptCandidate, New-AptPromotion,
