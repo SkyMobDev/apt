@@ -77,10 +77,11 @@ Components: main
 Signed-By: /etc/apt/keyrings/skymob.asc
 EOF
 sudo apt update
-sudo apt install skbridge skprinter</code></pre>
+sudo apt install skbridge</code></pre>
 
-<p>Install only what the appliance needs; the two are independent and coexist.
-Every later upgrade is <code>sudo apt upgrade</code>.</p>
+<p>Add <code>skprinter</code> if the site prints labels. The two are independent
+and coexist on one appliance. Every later upgrade is
+<code>sudo apt upgrade</code>.</p>
 
 <h2>Beta</h2>
 <p>New versions land on a <code>beta</code> suite first and stay there until they

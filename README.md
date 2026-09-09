@@ -32,11 +32,11 @@ Components: main
 Signed-By: /etc/apt/keyrings/skymob.asc
 EOF
 sudo apt update
-sudo apt install skbridge skprinter
+sudo apt install skbridge          # add skprinter if the site prints labels
 ```
 
-Install only what the appliance needs — `skprinter` is for a site that prints
-labels; the two are independent and coexist. The architecture is left out on
+The two packages are independent and coexist on one appliance; install what
+that site actually needs. The architecture is left out on
 purpose: apt fetches the index matching the machine's own dpkg architecture.
 Every later upgrade is `sudo apt upgrade`.
 
@@ -154,9 +154,14 @@ packages but never starts them, so nothing automated has seen the services run.
 `New-AptPromotion` downloads both architectures' `.deb` with **your** GitHub
 access and commits them next to the manifest edit, so the pull request shows
 exactly what customers will receive. It refuses a version whose release is
-missing either architecture, keeps the previous version, and stops if the
-working tree is dirty or you are not on `main`. Merging the pull request is
-what publishes.
+missing either architecture, and stops if the working tree is dirty or you are
+not on `main`. Merging the pull request is what publishes.
+
+How much history a channel keeps differs by channel: stable holds two versions
+of each package, so a site has somewhere to retreat to, while beta holds one —
+a canary retreats to stable rather than to an older candidate. `-Keep` overrides
+it per call, and a version too low to fit the window is refused rather than
+written into a manifest it would immediately fall out of.
 
 That download is the only crossing from private to public, and a person makes
 it. CI holds no credential for `iot-edge` and cannot reach it.

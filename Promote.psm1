@@ -502,7 +502,10 @@ function Submit-ChannelChange {
         git -C $script:RepoRoot checkout --quiet -- $script:Channels.ForEach({ "$_.list" }) pool
         git -C $script:RepoRoot clean --quiet -fd -- pool
         git -C $script:RepoRoot switch --quiet --force $origin
-        git -C $script:RepoRoot branch --quiet -D $Branch
+        # Only if the switch worked: deleting the branch you are on fails, and
+        # the second error would bury the one that brought us here.
+        if ($LASTEXITCODE -eq 0) { git -C $script:RepoRoot branch --quiet -D $Branch }
+        else { Write-Warning "could not return to '$origin'; you are still on $Branch" }
         throw
     }
     Write-Host "Committed on $Branch" -ForegroundColor Green
@@ -609,6 +612,11 @@ function Select-KeptVersions {
         version a suite carries, so the one that must survive the window is the
         highest — taking the first $Keep of an unordered list can drop exactly
         the version a site would retreat to.
+
+        Ordering has a consequence worth refusing rather than performing: a
+        version low enough to fall outside the window would be "added" to a
+        manifest that never mentions it. Silently, that turns a promotion into
+        nothing and a move into a deletion.
     #>
     param(
         [Parameter(Mandatory)][string]$Package,
@@ -617,12 +625,19 @@ function Select-KeptVersions {
         [Parameter(Mandatory)][int]$Keep
     )
 
-    @(
+    $kept = @(
         [pscustomobject]@{ Package = $Package; Version = $Version }
         $Existing
     ) |
         Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_.Version } } |
         Select-Object -First $Keep
+
+    if ($Version -notin $kept.Version) {
+        throw ("$Package $Version is lower than the $Keep version(s) the channel already keeps " +
+            "($(($kept | ForEach-Object { $_.Version }) -join ', ')), so it would drop straight " +
+            "back out of the manifest — raise -Keep if you mean to carry it as well")
+    }
+    return $kept
 }
 
 function Assert-ChannelKeepsPackage {
@@ -633,9 +648,9 @@ function Assert-ChannelKeepsPackage {
 
     .DESCRIPTION
         Remove-AptPromotion is not the only way to drop the last version: a
-        -Keep too small, or a move out of stable, gets there too. The guard
-        belongs to the outcome, so every mutation runs it against the manifest
-        it is about to write.
+        move out of stable gets there too. The guard belongs to the outcome, so
+        every mutation runs it against the manifest it is about to write, even
+        where the caller's own arithmetic should already have ruled it out.
     #>
     param(
         [Parameter(Mandatory)][string]$Channel,
@@ -685,29 +700,23 @@ function Write-ChannelFile {
     $isEntry = { param($line) [bool](($line -replace '#.*', '').Trim()) }
 
     $header = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in $existing) {
-        if (& $isEntry $line) { break }
-        $header.Add($line.TrimEnd())
-    }
-    while ($header.Count -gt 0 -and -not $header[$header.Count - 1]) {
-        $header.RemoveAt($header.Count - 1)
+    # The header is the comment block the file opens with, found by its own
+    # shape rather than by where the entries happen to be. Position cannot tell
+    # header from footer once a manifest empties, and beta empties routinely.
+    $i = 0
+    while ($i -lt $existing.Count -and $existing[$i] -match '^\s*#') {
+        $header.Add($existing[$i].TrimEnd())
+        $i++
     }
 
-    # Anything commented after the last entry is kept as well. Only the entries
-    # are rewritten, so a note someone left at the foot of the file survives
-    # instead of disappearing on the next promotion.
-    $lastEntry = -1
-    for ($i = 0; $i -lt $existing.Count; $i++) { if (& $isEntry $existing[$i]) { $lastEntry = $i } }
+    # Every other comment is kept, collected below the entries. Notes someone
+    # wrote between two entries end up at the foot rather than beside what they
+    # were about — moved, which is visible in the diff, instead of deleted.
     $footer = [System.Collections.Generic.List[string]]::new()
-    if ($lastEntry -ge 0) {
-        foreach ($line in $existing[($lastEntry + 1)..($existing.Count - 1)]) {
-            if (& $isEntry $line) { continue }
-            $footer.Add($line.TrimEnd())
-        }
-        while ($footer.Count -gt 0 -and -not $footer[0]) { $footer.RemoveAt(0) }
-        while ($footer.Count -gt 0 -and -not $footer[$footer.Count - 1]) {
-            $footer.RemoveAt($footer.Count - 1)
-        }
+    for ($j = $i; $j -lt $existing.Count; $j++) {
+        $line = $existing[$j]
+        if ((& $isEntry $line) -or -not $line.Trim()) { continue }
+        $footer.Add($line.TrimEnd())
     }
 
     $lines = @($header) + @('') + @($Entries | ForEach-Object { "$($_.Package) $($_.Version)" })
@@ -797,7 +806,8 @@ function ConvertTo-SortableVersion {
         way apt does.
 
     .DESCRIPTION
-        Never throws. It runs inside Sort-Object expressions, where an
+        Never throws on a version a manifest can hold. It runs inside
+        Sort-Object expressions, where an
         exception is not caught by the caller: it prints an error, leaves the
         item unsorted, and turns terminating under $ErrorActionPreference
         'Stop' — so an unparseable version would silently mis-order the very

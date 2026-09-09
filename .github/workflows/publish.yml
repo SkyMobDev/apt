@@ -200,13 +200,18 @@ jobs:
 
       - name: verify the index installs on Debian 13
         # Runs against the exact tree that deploys, on the distro we support,
-        # through apt itself: a bad signature, a missing arch index or an
-        # unsatisfiable dependency fails here instead of on the appliances.
+        # through apt itself: a bad signature or an unsatisfiable dependency
+        # fails here instead of on the appliances.
+        #
+        # amd64 only — this runner's architecture. The arm64 .deb is checked for
+        # integrity by the pool step and indexed here, but nothing installs it,
+        # so arm64 dependency resolution and maintainer scripts are covered by
+        # the manual VM/hardware pass in SMOKE-TEST.md and not by CI.
         #
         # Twice: once as an ordinary site on stable alone, once as a canary on
-        # stable and beta together. The canary pass is what proves the suites
-        # coexist — that beta resolves, and that apt prefers it where it carries
-        # the higher version.
+        # stable and beta together. The canary pass checks the suites coexist —
+        # that adding beta to Suites: does not break resolution. It does not
+        # assert which suite wins, and cannot: beta is empty most of the time.
         #
         # Each pass installs every package at once rather than one at a time.
         # These packages share an appliance, and a path two of them both ship
