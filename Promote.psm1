@@ -57,11 +57,13 @@ $script:Channels = @('stable', 'beta')
 # to stable, and an empty suite is something apt reads without complaint.
 $script:RequiredChannels = @('stable')
 
-# Versions of a package each channel keeps in the pool. stable keeps two: apt
-# can only downgrade to a version the pool still carries, so the older one is
-# what a site retreats to. beta keeps one, because a canary retreats to stable
-# rather than to an older candidate.
-$script:ChannelKeep = @{ stable = 2; beta = 1 }
+# Versions of a package each channel keeps in the pool. apt can only downgrade
+# to a version the pool still carries, so this is the depth of a site's retreat.
+# stable keeps three: promotions here can skip a long way — 0.1.26 to 0.1.41 was
+# fifteen releases — and with two, the only fallback is the version the site is
+# leaving, which is no help when that one is the problem. beta keeps one, since
+# a canary retreats to stable rather than to an older candidate.
+$script:ChannelKeep = @{ stable = 3; beta = 1 }
 
 # Upstream tags are named for the project that builds them, which is not always
 # the Debian package that project produces. SKPrinter.Appliance tags as

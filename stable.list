@@ -18,10 +18,12 @@
 # (skprinter-v* is the Windows build, which ships no .deb). Promote.psm1 holds
 # the mapping; that is the only place the two names meet.
 #
-# Keep the previous version listed too: apt installs the newest by default,
-# and the older one in the pool is what makes `apt install skbridge=<old>`
-# work when a site has to go back.
+# Keep the previous versions listed too: apt installs the newest by default,
+# and the older ones in the pool are what make `apt install skbridge=<old>`
+# work when a site has to go back. Three deep, so a site leaving a bad version
+# has somewhere to land other than the one it is leaving.
 
 skprinter 0.1.5
 skbridge 0.1.41
 skbridge 0.1.26
+skbridge 0.1.24

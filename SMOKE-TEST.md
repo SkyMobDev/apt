@@ -190,7 +190,7 @@ skbridge --version
 ```
 
 This only works while the pool still carries the older version, which is why
-`stable.list` keeps two of each package.
+`stable.list` keeps three of each package.
 
 State must survive both directions:
 

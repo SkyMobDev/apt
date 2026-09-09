@@ -66,7 +66,7 @@ sudo apt install skbridge=<stable version> --allow-downgrades
 ```
 
 The version has to be one the pool still carries, which is what `stable.list`
-keeping two of each is for.
+keeping three of each is for.
 
 ## Signing key
 
@@ -157,9 +157,11 @@ exactly what customers will receive. It refuses a version whose release is
 missing either architecture, and stops if the working tree is dirty or you are
 not on `main`. Merging the pull request is what publishes.
 
-How much history a channel keeps differs by channel: stable holds two versions
-of each package, so a site has somewhere to retreat to, while beta holds one —
-a canary retreats to stable rather than to an older candidate. `-Keep` overrides
+How much history a channel keeps differs by channel: stable holds three
+versions of each package, while beta holds one — a canary retreats to stable
+rather than to an older candidate. Three rather than two because promotions can
+skip a long way, and with only two the sole fallback is the version the site is
+leaving, which is no help when that is the one misbehaving. `-Keep` overrides
 it per call, and a version too low to fit the window is refused rather than
 written into a manifest it would immediately fall out of.
 
@@ -171,7 +173,7 @@ Rolling a bad version back is `Remove-AptPromotion -Package <pkg> -Version <bad>
 reverting the promotion commit, which stops working as soon as a later promotion
 has touched the same file. The pool is rebuilt without that version, and machines
 that took it return with `apt install <pkg>=<previous>` — which is why stable
-keeps two of each.
+keeps three of each.
 
 Withdrawing from beta may leave it empty. That is a normal state, not a
 breakage: canaries fall back to stable and apt reads an empty suite without
