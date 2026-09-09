@@ -18,3 +18,6 @@
 # a commit where the manifests and the pool disagree.
 #
 # Format is stable.list's: "<package> <version>", one per line.
+
+skbridge 0.1.41
+skprinter 0.1.5

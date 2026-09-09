@@ -23,7 +23,5 @@
 # work when a site has to go back. Three deep, so a site leaving a bad version
 # has somewhere to land other than the one it is leaving.
 
-skprinter 0.1.5
-skbridge 0.1.41
 skbridge 0.1.26
 skbridge 0.1.24
