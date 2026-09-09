@@ -17,11 +17,8 @@ not know rather than guessing.
 
 ## Installing
 
-Debian 13 (trixie). Earlier releases are not supported: `skbridge` needs glibc
-2.34 and trixie's `libssl3t64`, and `skprinter` needs glibc 2.38 — which
-bookworm's 2.36 does not satisfy either. The floors are read from the published
-binaries at package time, so they move on their own; `apt show <package>` has
-the current ones.
+Debian 13 (trixie) or newer — bookworm's glibc 2.36 is too old for `skprinter`,
+which needs 2.38.
 
 ```bash
 sudo apt install -y curl
