@@ -16,5 +16,5 @@
 # and the older one in the pool is what makes `apt install skbridge=<old>`
 # work when a site has to go back.
 
+skbridge 0.1.41
 skbridge 0.1.26
-skbridge 0.1.24
