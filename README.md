@@ -3,13 +3,22 @@
 Signed Debian package channel for the SkyMob edge appliances, served at
 **<https://apt.skymob.app>**.
 
-Currently carries `skbridge` (the LAN↔cloud bridge appliance) for `amd64`
-(virtual machines) and `arm64` (the physical appliance).
+Carries, for `amd64` (virtual machines) and `arm64` (the physical appliance):
+
+| Package | | Built from |
+|---|---|---|
+| `skbridge` | the LAN↔cloud bridge appliance | `skbridge-v*` |
+| `skprinter` | the label printer service, alongside the bridge on the same appliance | `skprinter-appliance-v*` |
+
+The upstream tag is named for the project, not for the package it produces —
+and `skprinter-v*` is a different product, the Windows SKPrinter, whose releases
+carry no `.deb`. `Promote.psm1` holds the mapping and refuses a package it does
+not know rather than guessing.
 
 ## Installing
 
-Debian 13 (trixie). Earlier releases are not supported — the packages need
-glibc 2.34 or newer and trixie's `libssl3t64`.
+Debian 13 (trixie) or newer — bookworm's glibc 2.36 is too old for `skprinter`,
+which needs 2.38.
 
 ```bash
 sudo apt install -y curl
@@ -23,11 +32,41 @@ Components: main
 Signed-By: /etc/apt/keyrings/skymob.asc
 EOF
 sudo apt update
-sudo apt install skbridge
+sudo apt install skbridge          # add skprinter if the site prints labels
 ```
 
-The architecture is left out on purpose: apt fetches the index matching the
-machine's own dpkg architecture. Every later upgrade is `sudo apt upgrade`.
+The two packages are independent and coexist on one appliance; install what
+that site actually needs. The architecture is left out on
+purpose: apt fetches the index matching the machine's own dpkg architecture.
+Every later upgrade is `sudo apt upgrade`.
+
+### Making a site a canary
+
+A new version normally lands on the **beta** suite first and stays there until
+it has proven itself on a few sites. Nothing else sees it. A site opts in by
+adding `beta` to the suites it subscribes to:
+
+```bash
+sudo sed -i 's/^Suites: stable$/Suites: stable beta/' \
+  /etc/apt/sources.list.d/skymob.sources
+sudo apt update && sudo apt upgrade
+```
+
+Keep `stable` in the list. apt installs the highest version across every suite a
+site subscribes to, so listing both means the site takes a beta version while one
+exists and falls back to stable the rest of the time. Dropping `stable` would
+instead leave it with only whatever beta happens to hold, which is usually
+nothing.
+
+Leaving the canary group is the same edit reversed. That does **not** uninstall
+the beta version already on the machine — apt does not downgrade on its own:
+
+```bash
+sudo apt install skbridge=<stable version> --allow-downgrades
+```
+
+The version has to be one the pool still carries, which is what `stable.list`
+keeping three of each is for.
 
 ## Signing key
 
@@ -79,55 +118,95 @@ appliance needs its `/etc/apt/keyrings/skymob.asc` replaced by hand before
 
 ## Promoting a release
 
-Cutting a `skbridge-v*` release upstream publishes nothing here. What reaches
-customers is exactly what [`stable.list`](stable.list) names, so promotion is a
-deliberate, reviewed edit. [`Promote.psm1`](Promote.psm1) drives it — it needs
-PowerShell 7 and a `gh` authenticated with read access to `iot-edge`:
+Cutting a release upstream publishes nothing here. What reaches customers is
+exactly what [`stable.list`](stable.list) and [`beta.list`](beta.list) name, so
+promotion is a deliberate, reviewed edit. [`Promote.psm1`](Promote.psm1) drives
+it — it needs PowerShell 7 and a `gh` authenticated with read access to
+`iot-edge`:
 
 ```powershell
 Import-Module .\Promote.psm1 -Force
 
-Get-AptChannel                            # published vs. available upstream
-Save-AptCandidate -Version 0.1.27         # pull the .deb, install it on a test VM
-New-AptPromotion  -Version 0.1.27 -Push   # branch + commit + pull request
-Test-AptChannel                           # after the merge: what the channel serves
+Get-AptChannel                                     # every package: which channel, vs. upstream
+Save-AptCandidate -Package skbridge -Version 0.2.0 # pull the .deb for a test VM
+
+New-AptPromotion  -Package skbridge -Version 0.2.0 -Channel beta -Push
+#   canaries take it; leave it to soak
+
+Move-AptPromotion -Package skbridge -Version 0.2.0 -Push   # beta -> stable
+Test-AptChannel                                    # after the merge: what the channels serve
 ```
+
+`Move-AptPromotion` downloads nothing: the `.deb` is already in the pool from
+the beta promotion, so going to stable is a manifest edit and no new bytes. It
+takes the version off beta as it joins stable, because canaries subscribe to
+both and keep receiving it from stable.
+
+Going straight to stable is `New-AptPromotion -Channel stable`. Skipping the
+soak is a decision, not the default.
+
+`-Package` and `-Channel` are required rather than defaulted: the channels reach
+very different numbers of machines, and a flag you can forget should not be what
+decides which. [`SMOKE-TEST.md`](SMOKE-TEST.md) is the manual check to run on a
+VM between `Save-AptCandidate` and `New-AptPromotion` — CI can install these
+packages but never starts them, so nothing automated has seen the services run.
 
 `New-AptPromotion` downloads both architectures' `.deb` with **your** GitHub
 access and commits them next to the manifest edit, so the pull request shows
 exactly what customers will receive. It refuses a version whose release is
-missing either architecture, keeps the previous version, and stops if the
-working tree is dirty or you are not on `main`. Merging the pull request is
-what publishes.
+missing either architecture, and stops if the working tree is dirty or you are
+not on `main`. Merging the pull request is what publishes.
+
+How much history a channel keeps differs by channel: stable holds three
+versions of each package, while beta holds one — a canary retreats to stable
+rather than to an older candidate. Three rather than two because promotions can
+skip a long way, and with only two the sole fallback is the version the site is
+leaving, which is no help when that is the one misbehaving. `-Keep` overrides
+it per call, and a version too low to fit the window is refused rather than
+written into a manifest it would immediately fall out of.
 
 That download is the only crossing from private to public, and a person makes
 it. CI holds no credential for `iot-edge` and cannot reach it.
 
-Rolling a bad version back is `Remove-AptPromotion -Version <bad> -Push`. It
-edits the manifest as it stands rather than reverting the promotion commit,
-which stops working as soon as a later promotion has touched the same file. The
-pool is rebuilt without that version, and machines that already took it return
-with `apt install skbridge=<previous>` — which is why the manifest keeps two.
+Rolling a bad version back is `Remove-AptPromotion -Package <pkg> -Version <bad>
+-Channel <channel> -Push`. It edits the manifest as it stands rather than
+reverting the promotion commit, which stops working as soon as a later promotion
+has touched the same file. The pool is rebuilt without that version, and machines
+that took it return with `apt install <pkg>=<previous>` — which is why stable
+keeps three of each.
+
+Withdrawing from beta may leave it empty. That is a normal state, not a
+breakage: canaries fall back to stable and apt reads an empty suite without
+complaint. `stable` is the one that may never empty out, so the same call is
+refused there when it would remove a package's last version.
 
 ## How this repository is published
 
 `.github/workflows/publish.yml` rebuilds the whole index on each run:
 
-1. checks the committed `pool/` holds exactly the `.deb` files `stable.list`
-   names — no more, no fewer,
-2. generates `Packages`/`Release` with `apt-ftparchive` and stamps a 90-day
-   `Valid-Until`,
-3. clear-signs `InRelease` and detach-signs `Release.gpg`,
-4. installs the result inside a `debian:13-slim` container through apt itself
-   before publishing,
+1. checks the committed `pool/` holds exactly the `.deb` files the manifests
+   name between them — no more, no fewer,
+2. generates one `Packages`/`Release` tree per suite over that shared pool, and
+   stamps each with a 90-day `Valid-Until`,
+3. clear-signs `InRelease` and detach-signs `Release.gpg`, for both suites,
+4. installs every package inside a `debian:13-slim` container through apt
+   itself — once as an ordinary site on stable, once as a canary on stable and
+   beta together — before publishing,
 5. deploys the tree to GitHub Pages.
 
 Consequences worth knowing before changing anything here:
 
+- **One pool, two suites.** `dists/stable` and `dists/beta` are separate
+  indices over the same `pool/`, so a version that appears on both is stored
+  once. It also means anything that prunes the pool has to consider both
+  manifests at once — `Sync-Pool` reads them itself rather than taking entries,
+  precisely so it cannot be handed half the picture.
 - **`pool/` is committed, `dists/` is not.** Committing the packages is what
   removes the need for any cross-repository credential in CI. The cost is that
-  each promoted version leaves about 11 MB in git history permanently, even
-  after it is withdrawn — only promotions add to that, not upstream releases.
+  each promoted version leaves its packages in git history permanently, even
+  after it is withdrawn — about 11 MB per `skbridge` version and 21 MB per
+  `skprinter` one, across both architectures. Only promotions add to that, not
+  upstream releases.
 - **The weekly schedule is not decorative.** The `Valid-Until` stamp lapses
   90 days after a publish, and apt then rejects the index outright — it will
   not fall back to cached lists. The schedule re-signs it and cannot promote

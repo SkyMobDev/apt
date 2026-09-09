@@ -1,12 +1,13 @@
 name: publish
 
-# Rebuilds the apt index from scratch on every run and deploys it to Pages.
-# Nothing is incremental and nothing is committed: the pool is re-downloaded
-# from the upstream releases each time, so the published repository is
-# reproducible from those releases alone and no .deb ever enters git history.
+# Rebuilds the apt indices from scratch on every run and deploys them to Pages.
+# Nothing here is incremental: the whole of dists/ is regenerated and re-signed
+# each time, over the pool/ this repository carries in git. The .deb files ARE
+# committed, by the person who promoted them — that is what lets this job hold
+# no credential for the private repository they came from.
 on:
-  # Merging a change to stable.list publishes it: the review on that pull
-  # request is the promotion gate, and `git revert` is the rollback.
+  # Merging a change to stable.list or beta.list publishes it: the review on
+  # that pull request is the promotion gate, and `git revert` is the rollback.
   push:
     branches: [main]
   workflow_dispatch:
@@ -15,7 +16,7 @@ on:
   # retries nor backfills a missed occurrence, and it disables schedules after
   # 60 days of repository inactivity — hence a window far longer than the
   # cadence. Runs at :17 because crons on the hour are likelier to be dropped
-  # under load. It re-signs the set stable.list already names, never promotes.
+  # under load. It re-signs the set the manifests already name, never promotes.
   schedule:
     - cron: "17 4 * * 1"
 
@@ -29,7 +30,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SUITE: stable
+  # stable is what a site gets by default; beta is the canary suite a site opts
+  # into by adding it to Suites:. One pool serves both.
+  SUITES: stable beta
   COMPONENT: main
   ARCHS: amd64 arm64
   VALID_DAYS: "90"
@@ -46,60 +49,119 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apt-utils
 
-      - name: check the pool matches stable.list
+      - name: check the pool matches the channel manifests
         # The .deb files are committed by whoever ran New-AptPromotion, so this
         # job needs no access to iot-edge at all. It only has to prove the two
         # halves of that commit agree: a manifest entry with no package would
         # publish a dangling index, and a package no entry names would reach
         # customers without anyone having decided it should.
+        #
+        # Checked against the union of the manifests, because the pool is shared:
+        # a file only beta names is legitimately there, and per-suite checking
+        # would call it stale.
         run: |
           set -euo pipefail
           expected=$(mktemp); actual=$(mktemp)
-          while read -r pkg version rest; do
-            case "$pkg" in '') continue ;; esac
-            { [ -n "$version" ] && [ -z "${rest:-}" ]; } ||
-              { echo "::error::malformed stable.list entry: $pkg $version $rest"; exit 1; }
-            for arch in $ARCHS; do
-              echo "pool/main/$(printf %.1s "$pkg")/$pkg/${pkg}_${version}_${arch}.deb" >> "$expected"
-            done
-          done < <(sed 's/#.*//; s/\r$//' stable.list)
-          [ -s "$expected" ] || { echo "::error::stable.list names no packages"; exit 1; }
-          sort -o "$expected" "$expected"
-          find pool -name '*.deb' 2>/dev/null | sort > "$actual"
-          if ! diff -u --label "named by stable.list" --label "committed in pool" \
+          for suite in $SUITES; do
+            # Explicitly, because the process substitution below reports a
+            # missing file only on stderr: the loop would read EOF and the
+            # suite would publish empty with this step still green.
+            [ -f "$suite.list" ] || { echo "::error::$suite.list is missing"; exit 1; }
+            while read -r pkg version rest; do
+              case "$pkg" in '') continue ;; esac
+              { [ -n "$version" ] && [ -z "${rest:-}" ]; } ||
+                { echo "::error::malformed $suite.list entry: $pkg $version $rest"; exit 1; }
+              for arch in $ARCHS; do
+                echo "pool/main/$(printf %.1s "$pkg")/$pkg/${pkg}_${version}_${arch}.deb" >> "$expected"
+              done
+            done < <(sed 's/#.*//; s/\r$//' "$suite.list")
+          done
+          # stable carries the fleet; an empty one stops `apt install` resolving
+          # at all. beta is allowed to be empty, and between candidates it is.
+          grep -q '[^[:space:]]' < <(sed 's/#.*//' stable.list) ||
+            { echo "::error::stable.list names no packages"; exit 1; }
+          sort -u -o "$expected" "$expected"
+          [ -d pool ] || { echo "::error::pool/ is missing"; exit 1; }
+          find pool -name '*.deb' | sort > "$actual"
+          if ! diff -u --label "named by the manifests" --label "committed in pool" \
                  "$expected" "$actual"; then
-            echo "::error::the committed pool does not match stable.list"
+            echo "::error::the committed pool does not match stable.list + beta.list"
             exit 1
           fi
+          # The filename is not the version. apt serves what the control file
+          # says, so a .deb renamed to a version it does not carry would publish
+          # under one number and install as another.
+          while read -r deb; do
+            want_name="${deb##*/}"
+            got="$(dpkg-deb -f "$deb" Package)_$(dpkg-deb -f "$deb" Version)_$(dpkg-deb -f "$deb" Architecture).deb"
+            [ "$got" = "$want_name" ] ||
+              { echo "::error::$deb carries $got"; exit 1; }
+          done < "$actual"
           cat "$actual"
 
       - name: build indices
+        # One pool, one index tree per suite. apt-ftparchive's `generate` takes a
+        # FileList per suite and arch, which is what lets both suites name the
+        # same pool/ paths instead of each needing its own copy of every .deb.
         run: |
           set -euo pipefail
-          for arch in $ARCHS; do
-            dir="dists/$SUITE/$COMPONENT/binary-$arch"
-            mkdir -p "$dir"
-            apt-ftparchive --arch "$arch" packages pool > "$dir/Packages"
-            gzip -9kf "$dir/Packages"
+          mkdir -p filelists
+          for suite in $SUITES; do
+            [ -f "$suite.list" ] || { echo "::error::$suite.list is missing"; exit 1; }
+            for arch in $ARCHS; do
+              : > "filelists/$suite-$COMPONENT-$arch"
+              while read -r pkg version rest; do
+                case "$pkg" in '') continue ;; esac
+                echo "pool/main/$(printf %.1s "$pkg")/$pkg/${pkg}_${version}_${arch}.deb" \
+                  >> "filelists/$suite-$COMPONENT-$arch"
+              done < <(sed 's/#.*//; s/\r$//' "$suite.list")
+              mkdir -p "dists/$suite/$COMPONENT/binary-$arch"
+            done
           done
-          # Written outside the scanned tree first: a redirect straight into
-          # dists/ would let apt-ftparchive hash the half-written Release into
-          # its own checksums.
-          apt-ftparchive \
-            -o APT::FTPArchive::Release::Origin=SkyMob \
-            -o APT::FTPArchive::Release::Label=SkyMob \
-            -o APT::FTPArchive::Release::Suite="$SUITE" \
-            -o APT::FTPArchive::Release::Codename="$SUITE" \
-            -o APT::FTPArchive::Release::Architectures="$ARCHS" \
-            -o APT::FTPArchive::Release::Components="$COMPONENT" \
-            -o APT::FTPArchive::Release::Description="SkyMob edge appliance packages" \
-            release "dists/$SUITE" > Release.tmp
-          # apt-ftparchive emits no Valid-Until; without one a captured index
-          # can be replayed at a stale version forever.
+
+          {
+            echo 'Dir { ArchiveDir "'"$PWD"'"; };'
+            echo 'Default { Packages::Compress ". gzip"; };'
+            for suite in $SUITES; do
+              echo 'tree "dists/'"$suite"'" {'
+              echo '  Sections "'"$COMPONENT"'";'
+              echo '  Architectures "'"$ARCHS"'";'
+              echo '  FileList "'"$PWD"'/filelists/'"$suite"'-$(SECTION)-$(ARCH)";'
+              echo '};'
+            done
+          } > ftparchive.conf
+          apt-ftparchive generate ftparchive.conf
+          # generate always writes Contents files and offers no way to turn them
+          # off (an empty Contents directive is ignored). Nothing here has ever
+          # served apt-file, so they go before the Release step hashes them in.
+          find dists -name 'Contents*' -delete
+
           valid=$(date -u -d "+$VALID_DAYS days" '+%a, %d %b %Y %H:%M:%S UTC')
-          sed -i "/^Date: /a Valid-Until: $valid" Release.tmp
-          mv Release.tmp "dists/$SUITE/Release"
-          cat "dists/$SUITE/Release"
+          for suite in $SUITES; do
+            # Written outside the scanned tree first: a redirect straight into
+            # dists/ would let apt-ftparchive hash the half-written Release into
+            # its own checksums.
+            apt-ftparchive \
+              -o APT::FTPArchive::Release::Origin=SkyMob \
+              -o APT::FTPArchive::Release::Label=SkyMob \
+              -o APT::FTPArchive::Release::Suite="$suite" \
+              -o APT::FTPArchive::Release::Codename="$suite" \
+              -o APT::FTPArchive::Release::Architectures="$ARCHS" \
+              -o APT::FTPArchive::Release::Components="$COMPONENT" \
+              -o APT::FTPArchive::Release::Description="SkyMob edge appliance packages ($suite)" \
+              release "dists/$suite" > Release.tmp
+            # apt-ftparchive emits no Valid-Until; without one a captured index
+            # can be replayed at a stale version forever. sed exits 0 when it
+            # matches nothing, so the anchor is checked rather than assumed.
+            grep -q '^Date: ' Release.tmp ||
+              { echo "::error::no Date: line to anchor Valid-Until to"; exit 1; }
+            sed -i "/^Date: /a Valid-Until: $valid" Release.tmp
+            grep -q '^Valid-Until: ' Release.tmp ||
+              { echo "::error::Valid-Until was not written"; exit 1; }
+            mv Release.tmp "dists/$suite/Release"
+            echo "--- dists/$suite/Release ---"
+            cat "dists/$suite/Release"
+          done
 
       - name: sign
         env:
@@ -119,8 +181,13 @@ jobs:
             chmod 600 "$GNUPGHOME/pw"
             args+=(--pinentry-mode loopback --passphrase-file "$GNUPGHOME/pw")
           fi
-          gpg "${args[@]}" --clearsign   -o "dists/$SUITE/InRelease"   "dists/$SUITE/Release"
-          gpg "${args[@]}" --detach-sign -o "dists/$SUITE/Release.gpg" "dists/$SUITE/Release"
+          # Both suites, every run. A canary subscribes to beta as well, and a
+          # lapsed beta breaks `apt update` on exactly the machines that agreed
+          # to be the ones finding problems early.
+          for suite in $SUITES; do
+            gpg "${args[@]}" --clearsign   -o "dists/$suite/InRelease"   "dists/$suite/Release"
+            gpg "${args[@]}" --detach-sign -o "dists/$suite/Release.gpg" "dists/$suite/Release"
+          done
           rm -rf "$GNUPGHOME"
 
       - name: assemble site
@@ -133,24 +200,57 @@ jobs:
 
       - name: verify the index installs on Debian 13
         # Runs against the exact tree that deploys, on the distro we support,
-        # through apt itself: a bad signature, a missing arch index or an
-        # unsatisfiable dependency fails here instead of on the appliances.
+        # through apt itself: a bad signature or an unsatisfiable dependency
+        # fails here instead of on the appliances.
+        #
+        # amd64 only — this runner's architecture. The arm64 .deb is checked for
+        # integrity by the pool step and indexed here, but nothing installs it,
+        # so arm64 dependency resolution and maintainer scripts are covered by
+        # the manual VM/hardware pass in SMOKE-TEST.md and not by CI.
+        #
+        # Twice: once as an ordinary site on stable alone, once as a canary on
+        # stable and beta together. The canary pass checks the suites coexist —
+        # that adding beta to Suites: does not break resolution. It does not
+        # assert which suite wins, and cannot: beta is empty most of the time.
+        #
+        # Each pass installs every package at once rather than one at a time.
+        # These packages share an appliance, and a path two of them both ship
+        # only collides when dpkg unpacks the second.
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/_site:/site:ro" debian:13-slim bash -eux -c '
-            install -d /etc/apt/keyrings
-            cp /site/skymob.asc /etc/apt/keyrings/skymob.asc
-            printf "%s\n" \
-              "Types: deb" \
-              "URIs: file:///site" \
-              "Suites: stable" \
-              "Components: main" \
-              "Signed-By: /etc/apt/keyrings/skymob.asc" \
-              > /etc/apt/sources.list.d/skymob.sources
-            apt-get update
-            apt-cache policy skbridge
-            apt-get install -y --download-only skbridge
-          '
+          names() { sed 's/#.*//; s/\r$//' "$@" | awk 'NF { print $1 }' | sort -u; }
+          stable_pkgs=$(names stable.list)
+          canary_pkgs=$(names stable.list beta.list)
+
+          verify() {
+            local label="$1" suites="$2" packages="$3"
+            echo "::group::$label ($suites)"
+            docker run --rm -v "$PWD/_site:/site:ro" \
+              -e SUITES="$suites" -e PACKAGES="$packages" \
+              debian:13-slim bash -eux -c '
+              install -d /etc/apt/keyrings
+              cp /site/skymob.asc /etc/apt/keyrings/skymob.asc
+              printf "%s\n" \
+                "Types: deb" \
+                "URIs: file:///site" \
+                "Suites: $SUITES" \
+                "Components: main" \
+                "Signed-By: /etc/apt/keyrings/skymob.asc" \
+                > /etc/apt/sources.list.d/skymob.sources
+              apt-get update
+              for pkg in $PACKAGES; do apt-cache policy "$pkg"; done
+              # A real install, not --download-only: unpacking is what proves the
+              # maintainer scripts run, the files land, and no two packages fight
+              # over a path. systemd is not running here, so the units are
+              # registered but never started — that part is the VM check.
+              apt-get install -y $PACKAGES
+              dpkg -l $PACKAGES
+            '
+            echo "::endgroup::"
+          }
+
+          verify "an ordinary site" "stable" "$stable_pkgs"
+          verify "a canary"         "stable beta" "$canary_pkgs"
 
       - uses: actions/upload-pages-artifact@v5
         with:

@@ -4,6 +4,8 @@
 /_site/
 /dists/
 /Release.tmp
+/filelists/
+/ftparchive.conf
 
 # Save-AptCandidate drops release builds here for testing before promotion.
 /candidates/

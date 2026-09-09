@@ -60,9 +60,10 @@
 <h1>SkyMob apt repository</h1>
 <p class="lede">Signed Debian package channel for the SkyMob edge appliances.</p>
 
-<p>Carries <code>skbridge</code>, the LAN&#8596;cloud bridge appliance, for
-<code>amd64</code> (virtual machines) and <code>arm64</code> (the physical
-appliance). Requires <strong>Debian 13 (trixie)</strong>.</p>
+<p>Carries <code>skbridge</code>, the LAN&#8596;cloud bridge appliance, and
+<code>skprinter</code>, the label printer service that runs alongside it — both
+for <code>amd64</code> (virtual machines) and <code>arm64</code> (the physical
+appliance). Requires <strong>Debian 13 (trixie) or newer</strong>.</p>
 
 <h2>Install</h2>
 <pre><code>sudo apt install -y curl
@@ -78,7 +79,22 @@ EOF
 sudo apt update
 sudo apt install skbridge</code></pre>
 
-<p>Every later upgrade is <code>sudo apt upgrade</code>.</p>
+<p>Add <code>skprinter</code> if the site prints labels. The two are independent
+and coexist on one appliance. Every later upgrade is
+<code>sudo apt upgrade</code>.</p>
+
+<h2>Beta</h2>
+<p>New versions land on a <code>beta</code> suite first and stay there until they
+have proven themselves. To let a site take them early, add it alongside
+<code>stable</code> &mdash; not instead of it, since beta is empty between
+candidates:</p>
+<pre><code>sudo sed -i 's/^Suites: stable$/Suites: stable beta/' \
+  /etc/apt/sources.list.d/skymob.sources
+sudo apt update &amp;&amp; sudo apt upgrade</code></pre>
+
+<p>Reverse the edit to leave. apt will not downgrade on its own, so a machine
+already carrying a beta version goes back with
+<code>sudo apt install &lt;package&gt;=&lt;version&gt; --allow-downgrades</code>.</p>
 
 <h2>Signing key</h2>
 <p><a href="skymob.asc">skymob.asc</a> &mdash; verify with
@@ -86,7 +102,7 @@ sudo apt install skbridge</code></pre>
 <pre class="fpr"><code>CB08 8823 E147 2096 157A  7917 ABEF 2B35 90BE B0ED</code></pre>
 
 <footer>
-  <a href="https://skymob.com.br">skymob.com.br</a>
+  <a href="https://skymob.app">skymob.app</a>
 </footer>
 
 </body>

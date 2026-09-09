@@ -1,17 +1,27 @@
-# Packages published to https://apt.skymob.app — this file IS the promotion
-# decision. Only what is named here is published, so cutting a release upstream
-# never reaches customers on its own.
+# Packages published to the stable suite of https://apt.skymob.app — this file
+# IS the promotion decision, and it is what every site gets by default. Only
+# what is named here is published, so cutting a release upstream never reaches
+# customers on its own.
 #
-# Edit it with New-AptPromotion / Remove-AptPromotion (Promote.psm1), not by
-# hand: the matching .deb files under pool/ have to move with it, and the
-# publish workflow refuses a commit where the two disagree.
+# beta.list is the same thing for the canary suite. The two share one pool: a
+# version normally lands on beta, soaks there, and is then moved here by
+# Move-AptPromotion, which needs no new download.
 #
-# Format: "<package> <version>", one per line. <version> must match a
-# <package>-v<version> release tag in SkyMobDev/iot-edge.
+# Edit it with New-AptPromotion -Channel stable / Move-AptPromotion /
+# Remove-AptPromotion -Channel stable (Promote.psm1), not by hand: the matching
+# .deb files under pool/ have to move with it, and the publish workflow refuses
+# a commit where the manifests and the pool disagree.
 #
-# Keep the previous version listed too: apt installs the newest by default,
-# and the older one in the pool is what makes `apt install skbridge=<old>`
-# work when a site has to go back.
+# Format: "<package> <version>", one per line. <version> must match a release
+# tag in SkyMobDev/iot-edge — but the tag is named for the project that builds
+# the package, not for the package. skprinter comes from skprinter-appliance-v*
+# (skprinter-v* is the Windows build, which ships no .deb). Promote.psm1 holds
+# the mapping; that is the only place the two names meet.
+#
+# Keep the previous versions listed too: apt installs the newest by default,
+# and the older ones in the pool are what make `apt install skbridge=<old>`
+# work when a site has to go back. Three deep, so a site leaving a bad version
+# has somewhere to land other than the one it is leaving.
 
 skbridge 0.1.26
 skbridge 0.1.24

@@ -1,0 +1,23 @@
+# Packages published to the beta suite of https://apt.skymob.app — the canary
+# channel. Sites opt in by adding `beta` to Suites: in their skymob.sources;
+# everyone else never sees what is listed here.
+#
+# apt installs the highest version across the suites a site subscribes to, so a
+# version listed here reaches canaries and nothing else. When it has soaked,
+# Move-AptPromotion carries it over to stable.list and takes it off this file —
+# canaries keep receiving it from stable, so leaving it on both would only pin a
+# second copy in the pool.
+#
+# This file is allowed to be empty, and normally is: between candidates there is
+# nothing to try out, canaries fall through to stable, and apt reads an empty
+# suite without complaint.
+#
+# Edit it with New-AptPromotion -Channel beta / Move-AptPromotion /
+# Remove-AptPromotion -Channel beta (Promote.psm1), not by hand: the matching
+# .deb files under pool/ have to move with it, and the publish workflow refuses
+# a commit where the manifests and the pool disagree.
+#
+# Format is stable.list's: "<package> <version>", one per line.
+
+skbridge 0.1.41
+skprinter 0.1.5
