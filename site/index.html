@@ -60,8 +60,9 @@
 <h1>SkyMob apt repository</h1>
 <p class="lede">Signed Debian package channel for the SkyMob edge appliances.</p>
 
-<p>Carries <code>skbridge</code>, the LAN&#8596;cloud bridge appliance, for
-<code>amd64</code> (virtual machines) and <code>arm64</code> (the physical
+<p>Carries <code>skbridge</code>, the LAN&#8596;cloud bridge appliance, and
+<code>skprinter</code>, the label printer service that runs alongside it — both
+for <code>amd64</code> (virtual machines) and <code>arm64</code> (the physical
 appliance). Requires <strong>Debian 13 (trixie)</strong>.</p>
 
 <h2>Install</h2>
@@ -76,9 +77,10 @@ Components: main
 Signed-By: /etc/apt/keyrings/skymob.asc
 EOF
 sudo apt update
-sudo apt install skbridge</code></pre>
+sudo apt install skbridge skprinter</code></pre>
 
-<p>Every later upgrade is <code>sudo apt upgrade</code>.</p>
+<p>Install only what the appliance needs; the two are independent and coexist.
+Every later upgrade is <code>sudo apt upgrade</code>.</p>
 
 <h2>Signing key</h2>
 <p><a href="skymob.asc">skymob.asc</a> &mdash; verify with

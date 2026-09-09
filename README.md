@@ -3,8 +3,17 @@
 Signed Debian package channel for the SkyMob edge appliances, served at
 **<https://apt.skymob.app>**.
 
-Currently carries `skbridge` (the LAN↔cloud bridge appliance) for `amd64`
-(virtual machines) and `arm64` (the physical appliance).
+Carries, for `amd64` (virtual machines) and `arm64` (the physical appliance):
+
+| Package | | Built from |
+|---|---|---|
+| `skbridge` | the LAN↔cloud bridge appliance | `skbridge-v*` |
+| `skprinter` | the label printer service, alongside the bridge on the same appliance | `skprinter-appliance-v*` |
+
+The upstream tag is named for the project, not for the package it produces —
+and `skprinter-v*` is a different product, the Windows SKPrinter, whose releases
+carry no `.deb`. `Promote.psm1` holds the mapping and refuses a package it does
+not know rather than guessing.
 
 ## Installing
 
@@ -23,11 +32,13 @@ Components: main
 Signed-By: /etc/apt/keyrings/skymob.asc
 EOF
 sudo apt update
-sudo apt install skbridge
+sudo apt install skbridge skprinter
 ```
 
-The architecture is left out on purpose: apt fetches the index matching the
-machine's own dpkg architecture. Every later upgrade is `sudo apt upgrade`.
+Install only what the appliance needs — `skprinter` is for a site that prints
+labels; the two are independent and coexist. The architecture is left out on
+purpose: apt fetches the index matching the machine's own dpkg architecture.
+Every later upgrade is `sudo apt upgrade`.
 
 ## Signing key
 
@@ -79,19 +90,25 @@ appliance needs its `/etc/apt/keyrings/skymob.asc` replaced by hand before
 
 ## Promoting a release
 
-Cutting a `skbridge-v*` release upstream publishes nothing here. What reaches
-customers is exactly what [`stable.list`](stable.list) names, so promotion is a
-deliberate, reviewed edit. [`Promote.psm1`](Promote.psm1) drives it — it needs
-PowerShell 7 and a `gh` authenticated with read access to `iot-edge`:
+Cutting a release upstream publishes nothing here. What reaches customers is
+exactly what [`stable.list`](stable.list) names, so promotion is a deliberate,
+reviewed edit. [`Promote.psm1`](Promote.psm1) drives it — it needs PowerShell 7
+and a `gh` authenticated with read access to `iot-edge`:
 
 ```powershell
 Import-Module .\Promote.psm1 -Force
 
-Get-AptChannel                            # published vs. available upstream
-Save-AptCandidate -Version 0.1.27         # pull the .deb, install it on a test VM
-New-AptPromotion  -Version 0.1.27 -Push   # branch + commit + pull request
-Test-AptChannel                           # after the merge: what the channel serves
+Get-AptChannel                                          # every package: published vs. upstream
+Save-AptCandidate -Package skbridge -Version 0.1.41     # pull the .deb for a test VM
+New-AptPromotion  -Package skbridge -Version 0.1.41 -Push   # branch + commit + pull request
+Test-AptChannel                                         # after the merge: what the channel serves
 ```
+
+`-Package` is required rather than defaulted: with more than one package on the
+channel, a forgotten flag would promote the wrong thing silently.
+[`SMOKE-TEST.md`](SMOKE-TEST.md) is the manual check to run on a VM between
+`Save-AptCandidate` and `New-AptPromotion` — CI can install these packages but
+never starts them, so nothing automated has seen the services run.
 
 `New-AptPromotion` downloads both architectures' `.deb` with **your** GitHub
 access and commits them next to the manifest edit, so the pull request shows
@@ -103,11 +120,11 @@ what publishes.
 That download is the only crossing from private to public, and a person makes
 it. CI holds no credential for `iot-edge` and cannot reach it.
 
-Rolling a bad version back is `Remove-AptPromotion -Version <bad> -Push`. It
-edits the manifest as it stands rather than reverting the promotion commit,
-which stops working as soon as a later promotion has touched the same file. The
-pool is rebuilt without that version, and machines that already took it return
-with `apt install skbridge=<previous>` — which is why the manifest keeps two.
+Rolling a bad version back is `Remove-AptPromotion -Package <pkg> -Version <bad>
+-Push`. It edits the manifest as it stands rather than reverting the promotion
+commit, which stops working as soon as a later promotion has touched the same
+file. The pool is rebuilt without that version, and machines that took it return
+with `apt install <pkg>=<previous>` — which is why the manifest keeps two.
 
 ## How this repository is published
 
@@ -118,16 +135,18 @@ with `apt install skbridge=<previous>` — which is why the manifest keeps two.
 2. generates `Packages`/`Release` with `apt-ftparchive` and stamps a 90-day
    `Valid-Until`,
 3. clear-signs `InRelease` and detach-signs `Release.gpg`,
-4. installs the result inside a `debian:13-slim` container through apt itself
-   before publishing,
+4. installs every package `stable.list` names inside a `debian:13-slim`
+   container, through apt itself and in a single call, before publishing,
 5. deploys the tree to GitHub Pages.
 
 Consequences worth knowing before changing anything here:
 
 - **`pool/` is committed, `dists/` is not.** Committing the packages is what
   removes the need for any cross-repository credential in CI. The cost is that
-  each promoted version leaves about 11 MB in git history permanently, even
-  after it is withdrawn — only promotions add to that, not upstream releases.
+  each promoted version leaves its packages in git history permanently, even
+  after it is withdrawn — about 11 MB per `skbridge` version and 21 MB per
+  `skprinter` one, across both architectures. Only promotions add to that, not
+  upstream releases.
 - **The weekly schedule is not decorative.** The `Valid-Until` stamp lapses
   90 days after a publish, and apt then rejects the index outright — it will
   not fall back to cached lists. The schedule re-signs it and cannot promote
