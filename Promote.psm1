@@ -221,26 +221,26 @@ function New-AptPromotion {
         return
     }
 
-    $subject = "feat: promove $Package $Version para o canal $Channel"
+    $subject = "feat: promote $Package $Version to the $Channel channel"
     $body = if (-not $isTop) {
-        "O canal $Channel já serve $Package $($promoted[0].Version), que é maior, então nenhum " +
-        "site muda sozinho: $Version fica instalável por versão exata, com " +
+        "The $Channel channel already serves $Package $($promoted[0].Version), which is higher, " +
+        "so no site moves on its own: $Version becomes installable by exact version, with " +
         "``apt install $Package=$Version``."
     }
     elseif ($Channel -eq 'beta') {
-        "Sites inscritos no beta passam a receber $Package $Version por ``apt upgrade``. " +
-        "O canal stable não muda."
+        "Sites subscribed to beta receive $Package $Version on ``apt upgrade``. " +
+        "The stable channel does not change."
     }
     elseif ($existing) {
-        "Sites em Debian 13 passam a receber $Package $Version por ``apt upgrade``."
+        "Debian 13 sites receive $Package $Version on ``apt upgrade``."
     }
     else {
         # Nothing to upgrade from on the first promotion: the package only
         # becomes installable once this is published.
-        "Primeira versão de $Package no canal. Sites em Debian 13 passam a " +
-        "poder instalá-lo com ``apt install $Package``."
+        "First version of $Package on the channel. Debian 13 sites can install it " +
+        "with ``apt install $Package``."
     }
-    if ($dropped) { $body += "`n`nSai do $Channel : $($dropped -join ', ')." }
+    if ($dropped) { $body += "`n`nLeaving $($Channel): $($dropped -join ', ')." }
     Submit-ChannelChange -Manifests @{ $Channel = $updated } -Branch $target `
         -Subject $subject -Body $body -Push:$Push
 }
@@ -305,20 +305,21 @@ function Move-AptPromotion {
         return
     }
 
-    $subject = "feat: $Package $Version sai do $From para o $To"
+    $subject = "feat: move $Package $Version from $From to $To"
     $body = if ($To -eq 'stable') {
-        "Soube-se o bastante no $From. Todos os sites em Debian 13 passam a " +
-        "receber $Package $Version por ``apt upgrade``; o .deb já está no pool, " +
-        "então nada novo sobe."
+        "Soaked long enough on $From. Every Debian 13 site receives $Package $Version " +
+        "on ``apt upgrade``; the .deb is already on the pool release, so nothing new " +
+        "is uploaded."
     }
     else {
         # stable -> beta: this takes a version away from the fleet rather than
         # giving it to them, so say that instead of the promotion sentence.
-        "$Package $Version sai do $From e passa a ser servido só para os canários " +
-        "inscritos no $To. Quem está no $From volta para a versão anterior com " +
-        "``apt install $Package=<anterior>``; o .deb já está no pool, então nada novo sobe."
+        "$Package $Version leaves $From and is served only to the canaries subscribed " +
+        "to $To. Sites on $From go back to the previous version with " +
+        "``apt install $Package=<previous>``; the .deb is already on the pool release, " +
+        "so nothing new is uploaded."
     }
-    if ($dropped) { $body += "`n`nSai do pool: $($dropped -join ', ')." }
+    if ($dropped) { $body += "`n`nLeaving $($To): $($dropped -join ', ')." }
     Submit-ChannelChange -Manifests @{ $From = $sourceUpdated; $To = $destinationUpdated } `
         -Branch $target -Subject $subject -Body $body -Push:$Push
 }
@@ -367,16 +368,16 @@ function Remove-AptPromotion {
         return
     }
 
-    $subject = "revert: retira $Package $Version do canal $Channel"
+    $subject = "revert: withdraw $Package $Version from the $Channel channel"
     $body = if ($remaining) {
         $fallback = @($remaining | Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } })[0]
-        "O canal volta a servir $Package $fallback. " +
-        "Sites que já atualizaram voltam com ``apt install $Package=$fallback``."
+        "The channel goes back to serving $Package $fallback. " +
+        "Sites that already upgraded return with ``apt install $Package=$fallback``."
     }
     else {
         # Only reachable on beta: stable is guarded above.
-        "O $Channel fica sem $Package. Os canários voltam ao que o stable serve, " +
-        "com ``apt install $Package=<versão do stable>``."
+        "The $Channel channel is left without $Package. Canaries go back to what stable serves, " +
+        "with ``apt install $Package=<stable version>``."
     }
     Submit-ChannelChange -Manifests @{ $Channel = $updated } -Branch $target `
         -Subject $subject -Body $body -Push:$Push
