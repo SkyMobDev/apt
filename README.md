@@ -24,7 +24,7 @@ which needs 2.38.
 sudo apt install -y curl
 sudo install -d /etc/apt/keyrings
 sudo curl -fsSL https://apt.skymob.app/skymob.asc -o /etc/apt/keyrings/skymob.asc
-sudo chmod 644 /etc/apt/keyrings/skymob.asc
+sudo chmod 644 /etc/apt/keyrings/skymob.asc   # apt reads the keyring as the _apt user
 sudo tee /etc/apt/sources.list.d/skymob.sources >/dev/null <<'EOF'
 Types: deb
 URIs: https://apt.skymob.app
