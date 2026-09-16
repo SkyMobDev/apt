@@ -24,6 +24,7 @@ which needs 2.38.
 sudo apt install -y curl
 sudo install -d /etc/apt/keyrings
 sudo curl -fsSL https://apt.skymob.app/skymob.asc -o /etc/apt/keyrings/skymob.asc
+sudo chmod 644 /etc/apt/keyrings/skymob.asc   # apt reads the keyring as the _apt user
 sudo tee /etc/apt/sources.list.d/skymob.sources >/dev/null <<'EOF'
 Types: deb
 URIs: https://apt.skymob.app
@@ -122,7 +123,7 @@ Cutting a release upstream publishes nothing here. What reaches customers is
 exactly what [`stable.list`](stable.list) and [`beta.list`](beta.list) name, so
 promotion is a deliberate, reviewed edit. [`Promote.psm1`](Promote.psm1) drives
 it — it needs PowerShell 7 and a `gh` authenticated with read access to
-`iot-edge`:
+`iot-edge` and write access to this repository:
 
 ```powershell
 Import-Module .\Promote.psm1 -Force
@@ -152,10 +153,13 @@ VM between `Save-AptCandidate` and `New-AptPromotion` — CI can install these
 packages but never starts them, so nothing automated has seen the services run.
 
 `New-AptPromotion` downloads both architectures' `.deb` with **your** GitHub
-access and commits them next to the manifest edit, so the pull request shows
-exactly what customers will receive. It refuses a version whose release is
-missing either architecture, and stops if the working tree is dirty or you are
-not on `main`. Merging the pull request is what publishes.
+access, uploads them to this repository's
+[`pool` release](https://github.com/SkyMobDev/apt/releases/tag/pool), and
+records their SHA-256 in [`SHA256SUMS`](SHA256SUMS) next to the manifest edit,
+so the pull request pins exactly the bytes customers will receive. It refuses a
+version whose release is missing either architecture, and stops if the working
+tree is dirty or you are not on `main`. Merging the pull request is what
+publishes.
 
 How much history a channel keeps differs by channel: stable holds three
 versions of each package, while beta holds one — a canary retreats to stable
@@ -171,21 +175,44 @@ it. CI holds no credential for `iot-edge` and cannot reach it.
 Rolling a bad version back is `Remove-AptPromotion -Package <pkg> -Version <bad>
 -Channel <channel> -Push`. It edits the manifest as it stands rather than
 reverting the promotion commit, which stops working as soon as a later promotion
-has touched the same file. The pool is rebuilt without that version, and machines
-that took it return with `apt install <pkg>=<previous>` — which is why stable
-keeps three of each.
+has touched the same file. The version's hashes leave `SHA256SUMS` while its
+files stay on the `pool` release, and machines that took it return with
+`apt install <pkg>=<previous>` — which is why stable keeps three of each.
 
 Withdrawing from beta may leave it empty. That is a normal state, not a
 breakage: canaries fall back to stable and apt reads an empty suite without
 complaint. `stable` is the one that may never empty out, so the same call is
 refused there when it would remove a package's last version.
 
+### Pruning the pool release
+
+Nothing but a promotion adds assets to the `pool` release. A version that leaves
+every manifest stops being published, but its files stay, which is what lets a
+revert bring it back. `Remove-AptStaleAsset` deletes the assets nothing records any more:
+
+```powershell
+Remove-AptStaleAsset -WhatIf    # what would go
+Remove-AptStaleAsset            # asks before each one
+```
+
+An asset is kept while `main`'s `SHA256SUMS` records it, while the head of an
+open pull request does, while a branch in your checkout does, or while it is
+younger than 14 days (`-GraceDays`) — the window that covers a promotion
+committed but not pushed yet. Those branches are read from GitHub rather than
+from your remote-tracking refs, and the command refuses to run at all if it
+cannot read `main`'s `SHA256SUMS`.
+
+Deleting is permanent: a pruned version comes back only by promoting it again.
+
 ## How this repository is published
 
 `.github/workflows/publish.yml` rebuilds the whole index on each run:
 
-1. checks the committed `pool/` holds exactly the `.deb` files the manifests
-   name between them — no more, no fewer,
+1. runs [`check-pool.sh`](check-pool.sh): `SHA256SUMS` has to record exactly the
+   `.deb` files the manifests name between them — no more, no fewer — and every
+   file downloaded from the `pool` release has to match its recorded hash. A
+   pull request runs this same script on its own, with no secrets, so a
+   promotion whose files are missing fails before the merge rather than after,
 2. generates one `Packages`/`Release` tree per suite over that shared pool, and
    stamps each with a 90-day `Valid-Until`,
 3. clear-signs `InRelease` and detach-signs `Release.gpg`, for both suites,
@@ -198,15 +225,15 @@ Consequences worth knowing before changing anything here:
 
 - **One pool, two suites.** `dists/stable` and `dists/beta` are separate
   indices over the same `pool/`, so a version that appears on both is stored
-  once. It also means anything that prunes the pool has to consider both
+  once. It also means anything that rewrites `SHA256SUMS` has to consider both
   manifests at once — `Sync-Pool` reads them itself rather than taking entries,
   precisely so it cannot be handed half the picture.
-- **`pool/` is committed, `dists/` is not.** Committing the packages is what
-  removes the need for any cross-repository credential in CI. The cost is that
-  each promoted version leaves its packages in git history permanently, even
-  after it is withdrawn — about 11 MB per `skbridge` version and 21 MB per
-  `skprinter` one, across both architectures. Only promotions add to that, not
-  upstream releases.
+- **The packages live on the `pool` release, not in git.** CI downloads them
+  with the workflow's own token, so it needs no credential for `iot-edge`, and a
+  promotion adds only text to history. What the review sees is `SHA256SUMS`, and
+  the hash check is what holds CI to it: never replace or delete an asset on
+  that release by hand. A replaced file fails the check and stops publishing;
+  so does a deleted one that a manifest still names, until it is uploaded again.
 - **The weekly schedule is not decorative.** The `Valid-Until` stamp lapses
   90 days after a publish, and apt then rejects the index outright — it will
   not fall back to cached lists. The schedule re-signs it and cannot promote

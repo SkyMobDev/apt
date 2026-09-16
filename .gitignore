@@ -1,8 +1,9 @@
-# Build output of .github/workflows/publish.yml. pool/ is NOT here: the .deb
-# files are committed, which is what lets CI publish without any credential
-# for the private repository.
+# Build output of .github/workflows/publish.yml. It downloads the .deb files
+# from the `pool` release into downloads/ and lays them out under pool/.
 /_site/
 /dists/
+/pool/
+/downloads/
 /Release.tmp
 /filelists/
 /ftparchive.conf

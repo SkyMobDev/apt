@@ -2,13 +2,19 @@ name: publish
 
 # Rebuilds the apt indices from scratch on every run and deploys them to Pages.
 # Nothing here is incremental: the whole of dists/ is regenerated and re-signed
-# each time, over the pool/ this repository carries in git. The .deb files ARE
-# committed, by the person who promoted them — that is what lets this job hold
-# no credential for the private repository they came from.
+# each time, over .deb files downloaded from this repository's `pool` release.
+# The person who promoted a version uploaded them there and recorded their
+# hashes in SHA256SUMS — that is what lets this job hold no credential for the
+# private repository they came from, and publish nothing but reviewed bytes.
 on:
   # Merging a change to stable.list or beta.list publishes it: the review on
   # that pull request is the promotion gate, and `git revert` is the rollback.
   push:
+    branches: [main]
+  # A pull request runs the checks alone: no secrets, nothing deployed. A
+  # promotion whose files never reached the release, or were renamed on the way,
+  # fails here instead of after the merge.
+  pull_request:
     branches: [main]
   workflow_dispatch:
   # The Release file carries a Valid-Until (see VALID_DAYS below); apt refuses
@@ -37,9 +43,27 @@ env:
   ARCHS: amd64 arm64
   VALID_DAYS: "90"
   KEY_FINGERPRINT: CB088823E1472096157A7917ABEF2B3590BEB0ED
+  # The release holding every .deb a manifest may name. Promote.psm1 uploads to
+  # it; this workflow only reads it.
+  POOL_RELEASE: pool
 
 jobs:
+  # What a pull request can be told without secrets: whether the manifests,
+  # SHA256SUMS and the release agree on the files, and whether those files still
+  # hash to what was reviewed.
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: check the manifests, SHA256SUMS and the pool release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ./check-pool.sh
+
   build:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -49,55 +73,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apt-utils
 
-      - name: check the pool matches the channel manifests
-        # The .deb files are committed by whoever ran New-AptPromotion, so this
-        # job needs no access to iot-edge at all. It only has to prove the two
-        # halves of that commit agree: a manifest entry with no package would
-        # publish a dangling index, and a package no entry names would reach
-        # customers without anyone having decided it should.
-        #
-        # Checked against the union of the manifests, because the pool is shared:
-        # a file only beta names is legitimately there, and per-suite checking
-        # would call it stale.
-        run: |
-          set -euo pipefail
-          expected=$(mktemp); actual=$(mktemp)
-          for suite in $SUITES; do
-            # Explicitly, because the process substitution below reports a
-            # missing file only on stderr: the loop would read EOF and the
-            # suite would publish empty with this step still green.
-            [ -f "$suite.list" ] || { echo "::error::$suite.list is missing"; exit 1; }
-            while read -r pkg version rest; do
-              case "$pkg" in '') continue ;; esac
-              { [ -n "$version" ] && [ -z "${rest:-}" ]; } ||
-                { echo "::error::malformed $suite.list entry: $pkg $version $rest"; exit 1; }
-              for arch in $ARCHS; do
-                echo "pool/main/$(printf %.1s "$pkg")/$pkg/${pkg}_${version}_${arch}.deb" >> "$expected"
-              done
-            done < <(sed 's/#.*//; s/\r$//' "$suite.list")
-          done
-          # stable carries the fleet; an empty one stops `apt install` resolving
-          # at all. beta is allowed to be empty, and between candidates it is.
-          grep -q '[^[:space:]]' < <(sed 's/#.*//' stable.list) ||
-            { echo "::error::stable.list names no packages"; exit 1; }
-          sort -u -o "$expected" "$expected"
-          [ -d pool ] || { echo "::error::pool/ is missing"; exit 1; }
-          find pool -name '*.deb' | sort > "$actual"
-          if ! diff -u --label "named by the manifests" --label "committed in pool" \
-                 "$expected" "$actual"; then
-            echo "::error::the committed pool does not match stable.list + beta.list"
-            exit 1
-          fi
-          # The filename is not the version. apt serves what the control file
-          # says, so a .deb renamed to a version it does not carry would publish
-          # under one number and install as another.
-          while read -r deb; do
-            want_name="${deb##*/}"
-            got="$(dpkg-deb -f "$deb" Package)_$(dpkg-deb -f "$deb" Version)_$(dpkg-deb -f "$deb" Architecture).deb"
-            [ "$got" = "$want_name" ] ||
-              { echo "::error::$deb carries $got"; exit 1; }
-          done < "$actual"
-          cat "$actual"
+      - name: check the manifests, SHA256SUMS and the pool release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ./check-pool.sh
 
       - name: build indices
         # One pool, one index tree per suite. apt-ftparchive's `generate` takes a
@@ -204,7 +183,7 @@ jobs:
         # fails here instead of on the appliances.
         #
         # amd64 only — this runner's architecture. The arm64 .deb is checked for
-        # integrity by the pool step and indexed here, but nothing installs it,
+        # integrity by the download step and indexed here, but nothing installs it,
         # so arm64 dependency resolution and maintainer scripts are covered by
         # the manual VM/hardware pass in SMOKE-TEST.md and not by CI.
         #

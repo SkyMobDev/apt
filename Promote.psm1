@@ -19,13 +19,17 @@
     moved to stable — Move-AptPromotion does that without downloading anything,
     since the .deb is already in the pool.
 
-    The .deb files are downloaded here and committed to this repository, so the
-    only thing that ever crosses from private to public is a person running
-    these commands with their own GitHub access. CI holds no credential for
-    iot-edge and cannot reach it.
+    The .deb files are downloaded here with your own GitHub access and uploaded
+    to this repository's `pool` release; SHA256SUMS records the hash of each and
+    is committed with the manifest edit. So the only thing that ever crosses
+    from private to public is a person running these commands, git carries no
+    binaries, and CI holds no credential for iot-edge and cannot reach it.
+
+    Nothing but a promotion adds assets to that release, and nothing but
+    Remove-AptStaleAsset deletes them.
 
     Requires the GitHub CLI, authenticated with read access to the (private)
-    iot-edge repository.
+    iot-edge repository and write access to this one.
 
 .EXAMPLE
     Import-Module .\Promote.psm1 -Force
@@ -40,6 +44,7 @@
 
     Test-AptChannel                                              # what the live channels serve
     Remove-AptPromotion -Package skbridge -Version 0.2.0 -Channel beta -Push
+    Remove-AptStaleAsset -WhatIf                                 # release assets no branch records
 #>
 
 $script:RepoRoot      = $PSScriptRoot
@@ -79,6 +84,14 @@ $script:ReleaseTagPrefix = [ordered]@{
 # The index is re-signed weekly, so anything older than this means at least one
 # cycle was missed. GitHub neither retries nor backfills a dropped schedule.
 $script:MaxSignedAgeDays = 10
+
+# The release on this repository holding every .deb a manifest may name, and the
+# committed file recording the hash each one must have to be published.
+$script:PoolRelease = 'pool'
+$script:HashFile    = 'SHA256SUMS'
+
+# owner/name of this repository, resolved from the checkout on first use.
+$script:ChannelRepository = $null
 
 function Get-AptChannel {
     <#
@@ -208,26 +221,26 @@ function New-AptPromotion {
         return
     }
 
-    $subject = "feat: promove $Package $Version para o canal $Channel"
+    $subject = "feat: promote $Package $Version to the $Channel channel"
     $body = if (-not $isTop) {
-        "O canal $Channel já serve $Package $($promoted[0].Version), que é maior, então nenhum " +
-        "site muda sozinho: $Version fica instalável por versão exata, com " +
+        "The $Channel channel already serves $Package $($promoted[0].Version), which is higher, " +
+        "so no site moves on its own: $Version becomes installable by exact version, with " +
         "``apt install $Package=$Version``."
     }
     elseif ($Channel -eq 'beta') {
-        "Sites inscritos no beta passam a receber $Package $Version por ``apt upgrade``. " +
-        "O canal stable não muda."
+        "Sites subscribed to beta receive $Package $Version on ``apt upgrade``. " +
+        "The stable channel does not change."
     }
     elseif ($existing) {
-        "Sites em Debian 13 passam a receber $Package $Version por ``apt upgrade``."
+        "Debian 13 sites receive $Package $Version on ``apt upgrade``."
     }
     else {
         # Nothing to upgrade from on the first promotion: the package only
         # becomes installable once this is published.
-        "Primeira versão de $Package no canal. Sites em Debian 13 passam a " +
-        "poder instalá-lo com ``apt install $Package``."
+        "First version of $Package on the channel. Debian 13 sites can install it " +
+        "with ``apt install $Package``."
     }
-    if ($dropped) { $body += "`n`nSai do $Channel : $($dropped -join ', ')." }
+    if ($dropped) { $body += "`n`nLeaving $($Channel): $($dropped -join ', ')." }
     Submit-ChannelChange -Manifests @{ $Channel = $updated } -Branch $target `
         -Subject $subject -Body $body -Push:$Push
 }
@@ -284,7 +297,7 @@ function Move-AptPromotion {
     Write-Host "    $To becomes: $(($promoted | ForEach-Object { $_.Version }) -join ', ')"
     $left = @($sourceUpdated | Where-Object Package -EQ $Package).Version
     Write-Host "    $From becomes: $(if ($left) { $left -join ', ' } else { '(empty for this package)' })"
-    if ($dropped) { Write-Host "    leaving the pool: $($dropped -join ', ')" -ForegroundColor DarkGray }
+    if ($dropped) { Write-Host "    leaving $To : $($dropped -join ', ')" -ForegroundColor DarkGray }
 
     $target = "promote/$To-$Package-$Version"
     if (-not $PSCmdlet.ShouldProcess((Get-ChannelFile -Channel $To),
@@ -292,20 +305,21 @@ function Move-AptPromotion {
         return
     }
 
-    $subject = "feat: $Package $Version sai do $From para o $To"
+    $subject = "feat: move $Package $Version from $From to $To"
     $body = if ($To -eq 'stable') {
-        "Soube-se o bastante no $From. Todos os sites em Debian 13 passam a " +
-        "receber $Package $Version por ``apt upgrade``; o .deb já está no pool, " +
-        "então nada novo sobe."
+        "Soaked long enough on $From. Every Debian 13 site receives $Package $Version " +
+        "on ``apt upgrade``; the .deb is already on the pool release, so nothing new " +
+        "is uploaded."
     }
     else {
         # stable -> beta: this takes a version away from the fleet rather than
         # giving it to them, so say that instead of the promotion sentence.
-        "$Package $Version sai do $From e passa a ser servido só para os canários " +
-        "inscritos no $To. Quem está no $From volta para a versão anterior com " +
-        "``apt install $Package=<anterior>``; o .deb já está no pool, então nada novo sobe."
+        "$Package $Version leaves $From and is served only to the canaries subscribed " +
+        "to $To. Sites on $From go back to the previous version with " +
+        "``apt install $Package=<previous>``; the .deb is already on the pool release, " +
+        "so nothing new is uploaded."
     }
-    if ($dropped) { $body += "`n`nSai do pool: $($dropped -join ', ')." }
+    if ($dropped) { $body += "`n`nLeaving $($To): $($dropped -join ', ')." }
     Submit-ChannelChange -Manifests @{ $From = $sourceUpdated; $To = $destinationUpdated } `
         -Branch $target -Subject $subject -Body $body -Push:$Push
 }
@@ -354,19 +368,99 @@ function Remove-AptPromotion {
         return
     }
 
-    $subject = "revert: retira $Package $Version do canal $Channel"
+    $subject = "revert: withdraw $Package $Version from the $Channel channel"
     $body = if ($remaining) {
         $fallback = @($remaining | Sort-Object -Descending -Property @{ Expression = { ConvertTo-SortableVersion $_ } })[0]
-        "O canal volta a servir $Package $fallback. " +
-        "Sites que já atualizaram voltam com ``apt install $Package=$fallback``."
+        "The channel goes back to serving $Package $fallback. " +
+        "Sites that already upgraded return with ``apt install $Package=$fallback``."
     }
     else {
         # Only reachable on beta: stable is guarded above.
-        "O $Channel fica sem $Package. Os canários voltam ao que o stable serve, " +
-        "com ``apt install $Package=<versão do stable>``."
+        "The $Channel channel is left without $Package. Canaries go back to what stable serves, " +
+        "with ``apt install $Package=<stable version>``."
     }
     Submit-ChannelChange -Manifests @{ $Channel = $updated } -Branch $target `
         -Subject $subject -Body $body -Push:$Push
+}
+
+function Remove-AptStaleAsset {
+    <#
+    .SYNOPSIS
+        Deletes the assets on the pool release that no branch's SHA256SUMS
+        records.
+
+    .DESCRIPTION
+        Promotions only add assets, which is what lets reverting a manifest
+        change republish the version it dropped. An asset is kept while the
+        default branch's SHA256SUMS records it, while the head of an open pull
+        request does, while a branch in this checkout does, or while it is
+        younger than -GraceDays — the window that covers a promotion someone has
+        committed but not pushed yet.
+
+        The branches that matter are read from the repository itself, not from
+        this checkout's remote-tracking refs, which can be stale or point
+        somewhere else entirely. Reading the default branch has to succeed: a
+        repository that answers nothing is not a repository where everything is
+        stale.
+
+        Deletion is permanent: a pruned version comes back only by promoting it
+        again. Try -WhatIf first; unless -Confirm:$false is given, every asset
+        asks before it goes.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param([ValidateRange(0, 365)][int]$GraceDays = 14)
+
+    $repository = Get-ChannelRepository
+    $defaultBranch = "$(gh api "repos/$repository" --jq .default_branch 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $defaultBranch) { throw "reading the default branch of $repository failed" }
+
+    $recorded = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $published = Get-RecordedNames -Repository $repository -Ref $defaultBranch
+    if ($null -eq $published) {
+        throw "$defaultBranch on $repository carries no $script:HashFile; refusing to treat every asset as stale"
+    }
+    foreach ($name in $published) { [void]$recorded.Add($name) }
+
+    $open = @(gh api "repos/$repository/pulls?state=open&per_page=100" --jq '.[].head.sha' 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "listing open pull requests of $repository failed" }
+    foreach ($sha in $open) {
+        foreach ($name in @(Get-RecordedNames -Repository $repository -Ref $sha)) { [void]$recorded.Add($name) }
+    }
+
+    # This checkout's own branches, which is where a promotion committed without
+    # -Push lives until it is pushed.
+    foreach ($ref in @(git -C $script:RepoRoot for-each-ref --format='%(refname)' refs/heads)) {
+        $lines = @(git -C $script:RepoRoot show "${ref}:$script:HashFile" 2>$null)
+        if ($LASTEXITCODE -ne 0) { continue }
+        foreach ($line in $lines) {
+            if ($line -cmatch '^[0-9a-f]{64}  ([^ ]+)$') { [void]$recorded.Add($Matches[1]) }
+        }
+    }
+
+    $assets = Get-PoolAssets
+    $cutoff = [datetime]::UtcNow.AddDays(-$GraceDays)
+    $unrecorded = foreach ($name in $assets.Keys) {
+        if ($recorded.Contains($name)) { continue }
+        $created = $assets[$name].CreatedAt
+        if ($created -and $created -gt $cutoff) {
+            Write-Host "    keeping $name, uploaded less than $GraceDays days ago" -ForegroundColor DarkGray
+            continue
+        }
+        $name
+    }
+    $stale = @($unrecorded | Sort-Object)
+    if (-not $stale) {
+        Write-Host "==> nothing on the $script:PoolRelease release is stale" -ForegroundColor Cyan
+        return
+    }
+
+    Write-Host "==> $($stale.Count) asset(s) on the $script:PoolRelease release that nothing records" -ForegroundColor Cyan
+    foreach ($name in $stale) {
+        if (-not $PSCmdlet.ShouldProcess("$repository release $script:PoolRelease", "delete $name")) { continue }
+        $out = gh release delete-asset $script:PoolRelease $name --repo $repository --yes 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "gh release delete-asset failed for ${name}: $out" }
+        Write-Host "    deleted $name" -ForegroundColor DarkGray
+    }
 }
 
 function Test-AptChannel {
@@ -468,11 +562,12 @@ function Submit-ChannelChange {
         [switch]$Push
     )
 
-    # Parse every manifest before touching anything. Sync-Pool reads them all,
-    # so a malformed line in the channel this call is not even editing would
-    # otherwise surface halfway through, on a fresh branch, with files already
-    # rewritten.
+    # Parse every manifest and SHA256SUMS before touching anything. Sync-Pool
+    # reads them all, so a malformed line in a file this call is not even
+    # editing would otherwise surface halfway through, on a fresh branch, with
+    # files already rewritten.
     foreach ($channel in $script:Channels) { $null = Read-ChannelFile -Channel $channel }
+    $null = Read-HashFile
 
     $origin = git -C $script:RepoRoot branch --show-current
     # --no-track: main is the base, not the upstream — the branch pushes to its
@@ -485,11 +580,10 @@ function Submit-ChannelChange {
             Write-ChannelFile -Channel $channel -Entries @($Manifests[$channel])
         }
         # After every manifest is written, never per channel: the pool is shared,
-        # so a sync run against one channel's entries alone would delete the
-        # other's.
+        # so a sync run against one channel's entries alone would drop the
+        # other's hashes.
         Sync-Pool
-        # --all so a withdrawn version's .deb files are staged as deletions.
-        git -C $script:RepoRoot add --all $script:Channels.ForEach({ "$_.list" }) pool
+        git -C $script:RepoRoot add $script:Channels.ForEach({ "$_.list" }) $script:HashFile
         if ($LASTEXITCODE -ne 0) { throw "git add failed" }
 
         git -C $script:RepoRoot commit -m $Subject -m $Body
@@ -499,10 +593,13 @@ function Submit-ChannelChange {
         # Assert-CleanMain ran at entry, so everything below is this call's own
         # work and there is nothing of yours here to lose. Leaving it behind
         # would strand the next run on "working tree is dirty".
+        #
+        # Assets Sync-Pool already uploaded stay on the pool release. No
+        # committed SHA256SUMS records them, so they publish nothing; a retry
+        # reuses them, and Remove-AptStaleAsset deletes them otherwise.
         Write-Host "Failed; undoing the half-made change" -ForegroundColor Yellow
         git -C $script:RepoRoot reset --quiet
-        git -C $script:RepoRoot checkout --quiet -- $script:Channels.ForEach({ "$_.list" }) pool
-        git -C $script:RepoRoot clean --quiet -fd -- pool
+        git -C $script:RepoRoot checkout --quiet -- $script:Channels.ForEach({ "$_.list" }) $script:HashFile
         git -C $script:RepoRoot switch --quiet --force $origin
         # Only if the switch worked: deleting the branch you are on fails, and
         # the second error would bury the one that brought us here.
@@ -530,10 +627,29 @@ function Submit-ChannelChange {
     Write-Host "Merging that PR publishes the channel. Squash with the commit subject as the title." -ForegroundColor Green
 }
 
-function Get-PoolPath {
-    param([Parameter(Mandatory)][string]$Package)
+function Get-ChannelRepository {
+    <#
+    .SYNOPSIS
+        owner/name of the repository behind this checkout's origin remote: the
+        one whose pool release this module uploads to and prunes.
 
-    Join-Path $script:RepoRoot "pool/main/$($Package.Substring(0, 1))/$Package"
+    .DESCRIPTION
+        Read from origin rather than asked of gh, which picks a remote named
+        upstream or github over origin when a clone has one. Uploading to one
+        repository while reading another's branches is how a prune deletes a
+        file something still needs.
+    #>
+    param()
+
+    if (-not $script:ChannelRepository) {
+        $url = "$(git -C $script:RepoRoot remote get-url origin 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $url) { throw "this checkout has no origin remote" }
+        if ($url -notmatch 'github[.]com[:/]+([^/]+)/(.+?)(?:[.]git)?/?$') {
+            throw "origin ($url) is not a GitHub repository"
+        }
+        $script:ChannelRepository = "$($Matches[1])/$($Matches[2])"
+    }
+    return $script:ChannelRepository
 }
 
 function Get-ReleaseTagPrefix {
@@ -562,45 +678,255 @@ function Get-ReleaseTag {
 function Sync-Pool {
     <#
     .SYNOPSIS
-        Makes the committed pool hold exactly the .deb files the channels name,
-        across all of them.
+        Makes SHA256SUMS record exactly the .deb files the channels name, across
+        all of them, uploading to the pool release any file it does not hold yet.
 
     .DESCRIPTION
         It reads the manifests itself rather than taking entries, because the
         pool is shared between the channels: handed one channel's entries it
-        would delete every .deb only the other names.
+        would drop every hash only the other names.
+
+        A file that leaves every manifest loses its line in SHA256SUMS and
+        nothing else. Its asset stays on the release, so reverting the change
+        republishes it; Remove-AptStaleAsset is what deletes it.
     #>
     param()
 
     $entries = @($script:Channels | ForEach-Object { Read-ChannelFile -Channel $_ })
+    $recorded = Read-HashFile
+    $assets = Get-PoolAssets
 
-    # Full paths, not names: a .deb filed under the wrong package directory is
-    # not the file the index will ask for, so matching on the name alone would
-    # leave it in place and hand CI a pool it then rejects.
-    $wanted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $hashes = @{}
     foreach ($entry in $entries) {
-        $dir = Get-PoolPath -Package $entry.Package
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
         foreach ($arch in $script:Architectures) {
             $file = "$($entry.Package)_$($entry.Version)_$arch.deb"
-            [void]$wanted.Add([System.IO.Path]::GetFullPath((Join-Path $dir $file)))
-            if (Test-Path -LiteralPath (Join-Path $dir $file)) { continue }
+            # Named by both channels while a move is being written: one line.
+            if ($hashes.ContainsKey($file)) { continue }
 
-            Write-Host "    fetching $file" -ForegroundColor DarkGray
-            $tag = Get-ReleaseTag -Package $entry.Package -Version $entry.Version
-            gh release download $tag --repo $script:Upstream `
-                --pattern $file --dir $dir --clobber 2>&1 | Write-Verbose
-            if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $file" }
+            if ($recorded.ContainsKey($file)) {
+                if ($assets.ContainsKey($file)) {
+                    # Published before, so CI will demand these exact bytes from
+                    # the release. Checking here names the file, instead of
+                    # leaving it to fail the publish this change triggers.
+                    Assert-PoolAsset -File $file -Asset $assets[$file]
+                    if ($assets[$file].Sha256 -ne $recorded[$file]) {
+                        throw "$file on the $script:PoolRelease release does not match the hash $script:HashFile records"
+                    }
+                    $hashes[$file] = $recorded[$file]
+                    continue
+                }
+                # Recorded but gone from the release, which every other command
+                # and the publish would trip over. Uploading it again is safe
+                # because the recorded hash decides what may go up.
+                Write-Host "    $file is recorded but missing from the $script:PoolRelease release" -ForegroundColor Yellow
+                $hashes[$file] = Publish-PoolAsset -Package $entry.Package -Version $entry.Version `
+                    -File $file -Assets $assets -ExpectedHash $recorded[$file]
+                continue
+            }
+
+            $hashes[$file] = Publish-PoolAsset -Package $entry.Package -Version $entry.Version `
+                -File $file -Assets $assets
         }
     }
 
-    $pool = Join-Path $script:RepoRoot 'pool'
-    if (-not (Test-Path -LiteralPath $pool)) { return }
-    foreach ($stale in Get-ChildItem -LiteralPath $pool -Filter '*.deb' -Recurse -File) {
-        if ($wanted.Contains([System.IO.Path]::GetFullPath($stale.FullName))) { continue }
-        Write-Host "    removing $($stale.Name)" -ForegroundColor DarkGray
-        Remove-Item -LiteralPath $stale.FullName -Force
+    Write-HashFile -Hashes $hashes
+}
+
+function Publish-PoolAsset {
+    <#
+    .SYNOPSIS
+        Uploads one .deb from its iot-edge release to the pool release and
+        returns its SHA-256.
+
+    .DESCRIPTION
+        An asset of that name may already be there, from a promotion that was
+        never merged or one that failed after uploading. It is reused only if
+        it holds the same bytes; a different file under a published name is
+        refused rather than replaced, since CI checks the bytes, not the name.
+
+        -ExpectedHash restores a file SHA256SUMS already records: what goes up
+        must hash to what was reviewed, or nothing does.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Package,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][hashtable]$Assets,
+        [string]$ExpectedHash
+    )
+
+    # GitHub rewrites an asset name it does not accept — a "~" lands as "." —
+    # and the manifests would then name a file the release does not hold.
+    if ($File -cnotmatch '^[A-Za-z0-9._+-]+$') {
+        throw "$File carries characters GitHub rewrites in an asset name"
     }
+
+    $temp = Join-Path ([System.IO.Path]::GetTempPath()) "apt-pool-$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    try {
+        Write-Host "    fetching $File" -ForegroundColor DarkGray
+        $tag = Get-ReleaseTag -Package $Package -Version $Version
+        $out = gh release download $tag --repo $script:Upstream --pattern $File --dir $temp 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "gh release download failed for ${File}: $out" }
+        $path = Join-Path $temp $File
+        if (-not (Test-Path -LiteralPath $path)) { throw "$tag carries no $File" }
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        if ($ExpectedHash -and $hash -ne $ExpectedHash) {
+            throw ("$tag now carries a different $File ($hash) than $script:HashFile records " +
+                "($ExpectedHash); that release was rebuilt and the published version cannot be restored from it")
+        }
+
+        if ($Assets.ContainsKey($File)) {
+            Assert-PoolAsset -File $File -Asset $Assets[$File]
+            if ($Assets[$File].Sha256 -ne $hash) {
+                throw ("the $script:PoolRelease release already holds a different $File " +
+                    "($($Assets[$File].Sha256)) than $tag ($hash); refusing to replace it")
+            }
+            Write-Host "    $File is already on the $script:PoolRelease release" -ForegroundColor DarkGray
+            return $hash
+        }
+
+        Write-Host "    uploading $File" -ForegroundColor DarkGray
+        $out = gh release upload $script:PoolRelease $path --repo (Get-ChannelRepository) 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for ${File}: $out" }
+
+        # Read back rather than trust the exit code: an upload lands under a
+        # rewritten name, or unfinished, without saying so.
+        $stored = (Get-PoolAssets)[$File]
+        if (-not $stored) {
+            throw "$File is not on the $script:PoolRelease release after the upload"
+        }
+        Assert-PoolAsset -File $File -Asset $stored
+        if ($stored.Sha256 -ne $hash) {
+            throw "$File on the $script:PoolRelease release does not match the file that was uploaded"
+        }
+        return $hash
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-PoolAsset {
+    <#
+    .SYNOPSIS
+        Refuses an asset that is not a finished upload with a digest to compare.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][pscustomobject]$Asset
+    )
+
+    if ($Asset.State -ne 'uploaded') {
+        throw ("$File on the $script:PoolRelease release is in state '$($Asset.State)' rather than " +
+            "uploaded; delete that asset and run this again")
+    }
+    if (-not $Asset.Sha256) {
+        throw "GitHub reports no digest for $File on the $script:PoolRelease release; a newer gh reports one"
+    }
+}
+
+function Get-PoolAssets {
+    <#
+    .SYNOPSIS
+        The pool release's assets, as file name -> Sha256, State and CreatedAt.
+    #>
+    param()
+
+    $repository = Get-ChannelRepository
+    # stderr kept out of what is parsed: folded in, a gh warning becomes a JSON
+    # error that says nothing about what went wrong.
+    $output = gh release view $script:PoolRelease --repo $repository --json assets 2>&1
+    $failures = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+    if ($LASTEXITCODE -ne 0) {
+        throw "release '$script:PoolRelease' not found on ${repository}: $($failures -join ' ')"
+    }
+    $json = @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
+
+    $assets = @{}
+    foreach ($asset in ($json | ConvertFrom-Json).assets) {
+        $assets[$asset.name] = [pscustomobject]@{
+            Sha256    = ($asset.digest -replace '^sha256:', '').ToLowerInvariant()
+            State     = $asset.state
+            CreatedAt = ConvertTo-UtcDate $asset.createdAt
+        }
+    }
+    return $assets
+}
+
+function ConvertTo-UtcDate {
+    <#
+    .SYNOPSIS
+        An asset timestamp as UTC, whether it arrives as the string GitHub sends
+        or as the local DateTime ConvertFrom-Json makes of it.
+    #>
+    param([Parameter(Mandatory)]$Value)
+
+    if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime() }
+    return [datetime]::Parse([string]$Value, [cultureinfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+}
+
+function Get-RecordedNames {
+    <#
+    .SYNOPSIS
+        The file names SHA256SUMS records at one ref of the channel repository,
+        or $null when that ref carries no SHA256SUMS.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Repository,
+        [Parameter(Mandatory)][string]$Ref
+    )
+
+    $output = gh api "repos/$Repository/contents/$($script:HashFile)?ref=$Ref" `
+        -H 'Accept: application/vnd.github.raw' 2>&1
+    $failures = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join ' '
+    if ($LASTEXITCODE -ne 0) {
+        if ($failures -match '404') { return $null }
+        throw "reading $script:HashFile at $Ref on ${Repository}: $failures"
+    }
+    $text = @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
+    return @($text -split "`r?`n" | ForEach-Object {
+            if ($_ -cmatch '^[0-9a-f]{64}  ([^ ]+)$') { $Matches[1] }
+        })
+}
+
+function Read-HashFile {
+    <#
+    .SYNOPSIS
+        SHA256SUMS as file name -> lowercase SHA-256.
+    #>
+    param()
+
+    $file = Join-Path $script:RepoRoot $script:HashFile
+    if (-not (Test-Path -LiteralPath $file)) { throw "$script:HashFile is missing from $($script:RepoRoot)" }
+
+    $hashes = @{}
+    foreach ($line in Get-Content -LiteralPath $file) {
+        if (-not $line.Trim()) { continue }
+        # Two spaces between hash and name, as sha256sum writes it and as the
+        # workflow's `sha256sum --strict -c` requires.
+        if ($line -cnotmatch '^([0-9a-f]{64})  ([^ /]+[.]deb)$') {
+            throw "malformed $script:HashFile line: '$line'"
+        }
+        if ($hashes.ContainsKey($Matches[2])) { throw "$($Matches[2]) appears twice in $script:HashFile" }
+        $hashes[$Matches[2]] = $Matches[1]
+    }
+    return $hashes
+}
+
+function Write-HashFile {
+    param([Parameter(Mandatory)][hashtable]$Hashes)
+
+    $names = [string[]]@($Hashes.Keys)
+    # Ordinal, so the order does not depend on the culture of the machine that
+    # promoted and the diff shows only real changes.
+    [System.Array]::Sort($names, [System.StringComparer]::Ordinal)
+    $lines = @($names | ForEach-Object { "$($Hashes[$_])  $_" })
+    # LF explicitly, as for the manifests: the workflow reads this file on Linux.
+    [System.IO.File]::WriteAllText((Join-Path $script:RepoRoot $script:HashFile), (($lines -join "`n") + "`n"))
 }
 
 function Select-KeptVersions {
@@ -835,4 +1161,4 @@ function ConvertTo-SortableVersion {
 }
 
 Export-ModuleMember -Function Get-AptChannel, Save-AptCandidate, New-AptPromotion,
-Move-AptPromotion, Remove-AptPromotion, Test-AptChannel, Get-ReleaseTag
+Move-AptPromotion, Remove-AptPromotion, Remove-AptStaleAsset, Test-AptChannel, Get-ReleaseTag
