@@ -380,10 +380,16 @@ Describe 'Remove-AptStaleAsset' {
 
     It 'refuses to run when the default branch records nothing' {
         InModuleScope Promote {
+            # As gh behaves when the file is not there: a message on stderr and a
+            # non-zero exit code, not a thrown error.
             Mock gh {
                 $global:LASTEXITCODE = 0
                 if ($args -contains 'repos/SkyMobDev/apt') { return 'main' }
-                if ("$args" -match 'contents/SHA256SUMS') { $global:LASTEXITCODE = 1; Write-Error 'gh: Not Found (HTTP 404)'; return }
+                if ("$args" -match 'contents/SHA256SUMS') {
+                    $global:LASTEXITCODE = 1
+                    return [System.Management.Automation.ErrorRecord]::new(
+                        [Exception]::new('gh: Not Found (HTTP 404)'), 'NotFound', 'NotSpecified', $null)
+                }
                 return '[]'
             }
             { Remove-AptStaleAsset -WhatIf } | Should -Throw -ExpectedMessage '*refusing to treat every asset as stale*'
