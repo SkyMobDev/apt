@@ -14,8 +14,8 @@
 #
 # Edit it with New-AptPromotion -Channel beta / Move-AptPromotion /
 # Remove-AptPromotion -Channel beta (Promote.psm1), not by hand: the matching
-# .deb files under pool/ have to move with it, and the publish workflow refuses
-# a commit where the manifests and the pool disagree.
+# hashes in SHA256SUMS have to move with it, and the publish workflow refuses a
+# commit where the manifests and SHA256SUMS disagree.
 #
 # Format is stable.list's: "<package> <version>", one per line.
 

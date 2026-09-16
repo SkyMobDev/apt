@@ -11,6 +11,11 @@ on:
   # that pull request is the promotion gate, and `git revert` is the rollback.
   push:
     branches: [main]
+  # A pull request runs the checks alone: no secrets, nothing deployed. A
+  # promotion whose files never reached the release, or were renamed on the way,
+  # fails here instead of after the merge.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   # The Release file carries a Valid-Until (see VALID_DAYS below); apt refuses
   # an index once it lapses, so this re-stamps and re-signs it. GitHub neither
@@ -43,7 +48,22 @@ env:
   POOL_RELEASE: pool
 
 jobs:
+  # What a pull request can be told without secrets: whether the manifests,
+  # SHA256SUMS and the release agree on the files, and whether those files still
+  # hash to what was reviewed.
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: check the manifests, SHA256SUMS and the pool release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ./check-pool.sh
+
   build:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -53,83 +73,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apt-utils
 
-      - name: check SHA256SUMS records what the manifests name
-        # A manifest entry with no recorded hash would publish bytes nobody
-        # reviewed, and a recorded hash no entry names means the two halves of a
-        # promotion disagree.
-        #
-        # Checked against the union of the manifests, because the pool is shared:
-        # a file only beta names is legitimately there, and per-suite checking
-        # would call it stale.
-        run: |
-          set -euo pipefail
-          expected=$(mktemp); recorded=$(mktemp)
-          for suite in $SUITES; do
-            # Explicitly, because the process substitution below reports a
-            # missing file only on stderr: the loop would read EOF and the
-            # suite would publish empty with this step still green.
-            [ -f "$suite.list" ] || { echo "::error::$suite.list is missing"; exit 1; }
-            while read -r pkg version rest; do
-              case "$pkg" in '') continue ;; esac
-              { [ -n "$version" ] && [ -z "${rest:-}" ]; } ||
-                { echo "::error::malformed $suite.list entry: $pkg $version $rest"; exit 1; }
-              for arch in $ARCHS; do
-                echo "${pkg}_${version}_${arch}.deb" >> "$expected"
-              done
-            done < <(sed 's/#.*//; s/\r$//' "$suite.list")
-          done
-          # stable carries the fleet; an empty one stops `apt install` resolving
-          # at all. beta is allowed to be empty, and between candidates it is.
-          grep -q '[^[:space:]]' < <(sed 's/#.*//' stable.list) ||
-            { echo "::error::stable.list names no packages"; exit 1; }
-          sort -u -o "$expected" "$expected"
-          [ -f SHA256SUMS ] || { echo "::error::SHA256SUMS is missing"; exit 1; }
-          # Two spaces between hash and name, as sha256sum writes it and as the
-          # download step's `sha256sum --strict -c` requires.
-          if grep -v -E '^([0-9a-f]{64}  [^ /]+\.deb)?$' SHA256SUMS; then
-            echo "::error::malformed SHA256SUMS lines above"
-            exit 1
-          fi
-          awk 'NF { print $2 }' SHA256SUMS | sort > "$recorded"
-          if ! diff -u --label "named by the manifests" --label "recorded in SHA256SUMS" \
-                 "$expected" "$recorded"; then
-            echo "::error::SHA256SUMS does not record exactly what stable.list + beta.list name"
-            exit 1
-          fi
-
-      - name: download the pool and check every hash
-        # Only the files SHA256SUMS records, each held to its recorded hash:
-        # replacing an asset on the release without a reviewed change to
-        # SHA256SUMS fails here, before anything is signed.
+      - name: check the manifests, SHA256SUMS and the pool release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir -p downloads
-          patterns=()
-          while read -r name; do patterns+=(--pattern "$name"); done < <(awk 'NF { print $2 }' SHA256SUMS)
-          gh release download "$POOL_RELEASE" --repo "$GITHUB_REPOSITORY" --dir downloads "${patterns[@]}"
-          # Compared by name as well, so a missing asset is reported as the file
-          # it is rather than as whatever gh makes of an unmatched pattern.
-          if ! diff -u --label "recorded in SHA256SUMS" --label "downloaded from $POOL_RELEASE" \
-                 <(awk 'NF { print $2 }' SHA256SUMS | sort) <(ls -1 downloads | sort); then
-            echo "::error::the $POOL_RELEASE release is missing files SHA256SUMS records"
-            exit 1
-          fi
-          (cd downloads && sha256sum --strict -c ../SHA256SUMS)
-          # The filename is not the version. apt serves what the control file
-          # says, so a .deb renamed to a version it does not carry would publish
-          # under one number and install as another.
-          for deb in downloads/*.deb; do
-            name="${deb##*/}"
-            got="$(dpkg-deb -f "$deb" Package)_$(dpkg-deb -f "$deb" Version)_$(dpkg-deb -f "$deb" Architecture).deb"
-            [ "$got" = "$name" ] || { echo "::error::$name carries $got"; exit 1; }
-            pkg="${name%%_*}"
-            dest="pool/main/$(printf %.1s "$pkg")/$pkg"
-            mkdir -p "$dest"
-            mv "$deb" "$dest/"
-          done
-          find pool -name '*.deb' | sort
+        run: bash ./check-pool.sh
 
       - name: build indices
         # One pool, one index tree per suite. apt-ftparchive's `generate` takes a

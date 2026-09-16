@@ -297,7 +297,7 @@ function Move-AptPromotion {
     Write-Host "    $To becomes: $(($promoted | ForEach-Object { $_.Version }) -join ', ')"
     $left = @($sourceUpdated | Where-Object Package -EQ $Package).Version
     Write-Host "    $From becomes: $(if ($left) { $left -join ', ' } else { '(empty for this package)' })"
-    if ($dropped) { Write-Host "    leaving the pool: $($dropped -join ', ')" -ForegroundColor DarkGray }
+    if ($dropped) { Write-Host "    leaving $To : $($dropped -join ', ')" -ForegroundColor DarkGray }
 
     $target = "promote/$To-$Package-$Version"
     if (-not $PSCmdlet.ShouldProcess((Get-ChannelFile -Channel $To),
@@ -391,49 +391,70 @@ function Remove-AptStaleAsset {
 
     .DESCRIPTION
         Promotions only add assets, which is what lets reverting a manifest
-        change republish the version it dropped. This deletes only what no
-        branch can publish any more: every local branch and every branch on
-        origin counts, so an open promotion keeps the file it just uploaded. A
-        merged promotion branch still kept locally holds its files back the same
-        way; delete it first if something you expect to go stays.
+        change republish the version it dropped. An asset is kept while the
+        default branch's SHA256SUMS records it, while the head of an open pull
+        request does, while a branch in this checkout does, or while it is
+        younger than -GraceDays — the window that covers a promotion someone has
+        committed but not pushed yet.
 
-        Deletion is permanent: a pruned version comes back only by uploading it
-        again from its iot-edge release. Try -WhatIf first; unless -Confirm:$false
-        is given, every asset asks before it goes.
+        The branches that matter are read from the repository itself, not from
+        this checkout's remote-tracking refs, which can be stale or point
+        somewhere else entirely. Reading the default branch has to succeed: a
+        repository that answers nothing is not a repository where everything is
+        stale.
+
+        Deletion is permanent: a pruned version comes back only by promoting it
+        again. Try -WhatIf first; unless -Confirm:$false is given, every asset
+        asks before it goes.
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
-    param()
+    param([ValidateRange(0, 365)][int]$GraceDays = 14)
 
-    $out = git -C $script:RepoRoot fetch --quiet --prune origin 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "git fetch failed: $out" }
-
-    $refs = @(git -C $script:RepoRoot for-each-ref --format='%(refname)' refs/heads refs/remotes/origin)
-    if ($LASTEXITCODE -ne 0) { throw "git for-each-ref failed" }
+    $repository = Get-ChannelRepository
+    $defaultBranch = "$(gh api "repos/$repository" --jq .default_branch 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $defaultBranch) { throw "reading the default branch of $repository failed" }
 
     $recorded = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($ref in $refs | Where-Object { $_ -ne 'refs/remotes/origin/HEAD' }) {
-        # A branch from before the pool moved to the release has no SHA256SUMS
-        # and cannot publish from it, so it holds nothing back.
+    $published = Get-RecordedNames -Repository $repository -Ref $defaultBranch
+    if ($null -eq $published) {
+        throw "$defaultBranch on $repository carries no $script:HashFile; refusing to treat every asset as stale"
+    }
+    foreach ($name in $published) { [void]$recorded.Add($name) }
+
+    $open = @(gh api "repos/$repository/pulls?state=open&per_page=100" --jq '.[].head.sha' 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "listing open pull requests of $repository failed" }
+    foreach ($sha in $open) {
+        foreach ($name in @(Get-RecordedNames -Repository $repository -Ref $sha)) { [void]$recorded.Add($name) }
+    }
+
+    # This checkout's own branches, which is where a promotion committed without
+    # -Push lives until it is pushed.
+    foreach ($ref in @(git -C $script:RepoRoot for-each-ref --format='%(refname)' refs/heads)) {
         $lines = @(git -C $script:RepoRoot show "${ref}:$script:HashFile" 2>$null)
         if ($LASTEXITCODE -ne 0) { continue }
         foreach ($line in $lines) {
             if ($line -cmatch '^[0-9a-f]{64}  ([^ ]+)$') { [void]$recorded.Add($Matches[1]) }
         }
     }
-    # Empty would mark every asset stale. That means the branches were not read,
-    # not that nothing is published — stable can never be empty.
-    if ($recorded.Count -eq 0) {
-        throw "no branch records any file in $script:HashFile; refusing to treat every asset as stale"
-    }
 
-    $repository = Get-ChannelRepository
-    $stale = @((Get-PoolAssets).Keys | Where-Object { -not $recorded.Contains($_) } | Sort-Object)
+    $assets = Get-PoolAssets
+    $cutoff = [datetime]::UtcNow.AddDays(-$GraceDays)
+    $unrecorded = foreach ($name in $assets.Keys) {
+        if ($recorded.Contains($name)) { continue }
+        $created = $assets[$name].CreatedAt
+        if ($created -and $created -gt $cutoff) {
+            Write-Host "    keeping $name, uploaded less than $GraceDays days ago" -ForegroundColor DarkGray
+            continue
+        }
+        $name
+    }
+    $stale = @($unrecorded | Sort-Object)
     if (-not $stale) {
-        Write-Host "==> every asset on the $script:PoolRelease release is recorded by a branch" -ForegroundColor Cyan
+        Write-Host "==> nothing on the $script:PoolRelease release is stale" -ForegroundColor Cyan
         return
     }
 
-    Write-Host "==> $($stale.Count) asset(s) on the $script:PoolRelease release that no branch records" -ForegroundColor Cyan
+    Write-Host "==> $($stale.Count) asset(s) on the $script:PoolRelease release that nothing records" -ForegroundColor Cyan
     foreach ($name in $stale) {
         if (-not $PSCmdlet.ShouldProcess("$repository release $script:PoolRelease", "delete $name")) { continue }
         $out = gh release delete-asset $script:PoolRelease $name --repo $repository --yes 2>&1
@@ -609,17 +630,24 @@ function Submit-ChannelChange {
 function Get-ChannelRepository {
     <#
     .SYNOPSIS
-        owner/name of the repository this module lives in, as gh resolves it
-        from the checkout's remote: the one whose pool release it maintains.
+        owner/name of the repository behind this checkout's origin remote: the
+        one whose pool release this module uploads to and prunes.
+
+    .DESCRIPTION
+        Read from origin rather than asked of gh, which picks a remote named
+        upstream or github over origin when a clone has one. Uploading to one
+        repository while reading another's branches is how a prune deletes a
+        file something still needs.
     #>
     param()
 
     if (-not $script:ChannelRepository) {
-        Push-Location $script:RepoRoot
-        try { $name = gh repo view --json nameWithOwner --jq .nameWithOwner 2>&1 }
-        finally { Pop-Location }
-        if ($LASTEXITCODE -ne 0) { throw "gh repo view failed in $($script:RepoRoot): $name" }
-        $script:ChannelRepository = "$name".Trim()
+        $url = "$(git -C $script:RepoRoot remote get-url origin 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $url) { throw "this checkout has no origin remote" }
+        if ($url -notmatch 'github[.]com[:/]+([^/]+)/(.+?)(?:[.]git)?/?$') {
+            throw "origin ($url) is not a GitHub repository"
+        }
+        $script:ChannelRepository = "$($Matches[1])/$($Matches[2])"
     }
     return $script:ChannelRepository
 }
@@ -676,17 +704,23 @@ function Sync-Pool {
             if ($hashes.ContainsKey($file)) { continue }
 
             if ($recorded.ContainsKey($file)) {
-                # Published before, so CI will demand these exact bytes from the
-                # release. Checking here names the file, instead of leaving it to
-                # fail the publish this change triggers.
-                if (-not $assets.ContainsKey($file)) {
-                    throw ("$file is recorded in $script:HashFile but missing from the " +
-                        "$script:PoolRelease release; upload it again from its iot-edge release")
+                if ($assets.ContainsKey($file)) {
+                    # Published before, so CI will demand these exact bytes from
+                    # the release. Checking here names the file, instead of
+                    # leaving it to fail the publish this change triggers.
+                    Assert-PoolAsset -File $file -Asset $assets[$file]
+                    if ($assets[$file].Sha256 -ne $recorded[$file]) {
+                        throw "$file on the $script:PoolRelease release does not match the hash $script:HashFile records"
+                    }
+                    $hashes[$file] = $recorded[$file]
+                    continue
                 }
-                if ($assets[$file] -ne $recorded[$file]) {
-                    throw "$file on the $script:PoolRelease release does not match the hash $script:HashFile records"
-                }
-                $hashes[$file] = $recorded[$file]
+                # Recorded but gone from the release, which every other command
+                # and the publish would trip over. Uploading it again is safe
+                # because the recorded hash decides what may go up.
+                Write-Host "    $file is recorded but missing from the $script:PoolRelease release" -ForegroundColor Yellow
+                $hashes[$file] = Publish-PoolAsset -Package $entry.Package -Version $entry.Version `
+                    -File $file -Assets $assets -ExpectedHash $recorded[$file]
                 continue
             }
 
@@ -709,13 +743,23 @@ function Publish-PoolAsset {
         never merged or one that failed after uploading. It is reused only if
         it holds the same bytes; a different file under a published name is
         refused rather than replaced, since CI checks the bytes, not the name.
+
+        -ExpectedHash restores a file SHA256SUMS already records: what goes up
+        must hash to what was reviewed, or nothing does.
     #>
     param(
         [Parameter(Mandatory)][string]$Package,
         [Parameter(Mandatory)][string]$Version,
         [Parameter(Mandatory)][string]$File,
-        [Parameter(Mandatory)][hashtable]$Assets
+        [Parameter(Mandatory)][hashtable]$Assets,
+        [string]$ExpectedHash
     )
+
+    # GitHub rewrites an asset name it does not accept — a "~" lands as "." —
+    # and the manifests would then name a file the release does not hold.
+    if ($File -cnotmatch '^[A-Za-z0-9._+-]+$') {
+        throw "$File carries characters GitHub rewrites in an asset name"
+    }
 
     $temp = Join-Path ([System.IO.Path]::GetTempPath()) "apt-pool-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Path $temp | Out-Null
@@ -728,10 +772,16 @@ function Publish-PoolAsset {
         if (-not (Test-Path -LiteralPath $path)) { throw "$tag carries no $File" }
         $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
 
+        if ($ExpectedHash -and $hash -ne $ExpectedHash) {
+            throw ("$tag now carries a different $File ($hash) than $script:HashFile records " +
+                "($ExpectedHash); that release was rebuilt and the published version cannot be restored from it")
+        }
+
         if ($Assets.ContainsKey($File)) {
-            if ($Assets[$File] -ne $hash) {
+            Assert-PoolAsset -File $File -Asset $Assets[$File]
+            if ($Assets[$File].Sha256 -ne $hash) {
                 throw ("the $script:PoolRelease release already holds a different $File " +
-                    "($($Assets[$File])) than $tag ($hash); refusing to replace it")
+                    "($($Assets[$File].Sha256)) than $tag ($hash); refusing to replace it")
             }
             Write-Host "    $File is already on the $script:PoolRelease release" -ForegroundColor DarkGray
             return $hash
@@ -740,6 +790,17 @@ function Publish-PoolAsset {
         Write-Host "    uploading $File" -ForegroundColor DarkGray
         $out = gh release upload $script:PoolRelease $path --repo (Get-ChannelRepository) 2>&1
         if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for ${File}: $out" }
+
+        # Read back rather than trust the exit code: an upload lands under a
+        # rewritten name, or unfinished, without saying so.
+        $stored = (Get-PoolAssets)[$File]
+        if (-not $stored) {
+            throw "$File is not on the $script:PoolRelease release after the upload"
+        }
+        Assert-PoolAsset -File $File -Asset $stored
+        if ($stored.Sha256 -ne $hash) {
+            throw "$File on the $script:PoolRelease release does not match the file that was uploaded"
+        }
         return $hash
     }
     finally {
@@ -747,22 +808,89 @@ function Publish-PoolAsset {
     }
 }
 
+function Assert-PoolAsset {
+    <#
+    .SYNOPSIS
+        Refuses an asset that is not a finished upload with a digest to compare.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][pscustomobject]$Asset
+    )
+
+    if ($Asset.State -ne 'uploaded') {
+        throw ("$File on the $script:PoolRelease release is in state '$($Asset.State)' rather than " +
+            "uploaded; delete that asset and run this again")
+    }
+    if (-not $Asset.Sha256) {
+        throw "GitHub reports no digest for $File on the $script:PoolRelease release; a newer gh reports one"
+    }
+}
+
 function Get-PoolAssets {
     <#
     .SYNOPSIS
-        The pool release's assets, as file name -> lowercase SHA-256.
+        The pool release's assets, as file name -> Sha256, State and CreatedAt.
     #>
     param()
 
     $repository = Get-ChannelRepository
-    $json = gh release view $script:PoolRelease --repo $repository --json assets 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "release '$script:PoolRelease' not found on ${repository}: $json" }
+    # stderr kept out of what is parsed: folded in, a gh warning becomes a JSON
+    # error that says nothing about what went wrong.
+    $output = gh release view $script:PoolRelease --repo $repository --json assets 2>&1
+    $failures = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+    if ($LASTEXITCODE -ne 0) {
+        throw "release '$script:PoolRelease' not found on ${repository}: $($failures -join ' ')"
+    }
+    $json = @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
 
     $assets = @{}
     foreach ($asset in ($json | ConvertFrom-Json).assets) {
-        $assets[$asset.name] = ($asset.digest -replace '^sha256:', '').ToLowerInvariant()
+        $assets[$asset.name] = [pscustomobject]@{
+            Sha256    = ($asset.digest -replace '^sha256:', '').ToLowerInvariant()
+            State     = $asset.state
+            CreatedAt = ConvertTo-UtcDate $asset.createdAt
+        }
     }
     return $assets
+}
+
+function ConvertTo-UtcDate {
+    <#
+    .SYNOPSIS
+        An asset timestamp as UTC, whether it arrives as the string GitHub sends
+        or as the local DateTime ConvertFrom-Json makes of it.
+    #>
+    param([Parameter(Mandatory)]$Value)
+
+    if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime() }
+    return [datetime]::Parse([string]$Value, [cultureinfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+}
+
+function Get-RecordedNames {
+    <#
+    .SYNOPSIS
+        The file names SHA256SUMS records at one ref of the channel repository,
+        or $null when that ref carries no SHA256SUMS.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Repository,
+        [Parameter(Mandatory)][string]$Ref
+    )
+
+    $output = gh api "repos/$Repository/contents/$($script:HashFile)?ref=$Ref" `
+        -H 'Accept: application/vnd.github.raw' 2>&1
+    $failures = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join ' '
+    if ($LASTEXITCODE -ne 0) {
+        if ($failures -match '404') { return $null }
+        throw "reading $script:HashFile at $Ref on ${Repository}: $failures"
+    }
+    $text = @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
+    return @($text -split "`r?`n" | ForEach-Object {
+            if ($_ -cmatch '^[0-9a-f]{64}  ([^ ]+)$') { $Matches[1] }
+        })
 }
 
 function Read-HashFile {

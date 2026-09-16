@@ -24,6 +24,7 @@ which needs 2.38.
 sudo apt install -y curl
 sudo install -d /etc/apt/keyrings
 sudo curl -fsSL https://apt.skymob.app/skymob.asc -o /etc/apt/keyrings/skymob.asc
+sudo chmod 644 /etc/apt/keyrings/skymob.asc
 sudo tee /etc/apt/sources.list.d/skymob.sources >/dev/null <<'EOF'
 Types: deb
 URIs: https://apt.skymob.app
@@ -187,26 +188,31 @@ refused there when it would remove a package's last version.
 
 Nothing but a promotion adds assets to the `pool` release. A version that leaves
 every manifest stops being published, but its files stay, which is what lets a
-revert bring it back. `Remove-AptStaleAsset` deletes the assets no branch's
-`SHA256SUMS` records — local branches and the ones on `origin` both count, so
-an open promotion keeps the file it just uploaded:
+revert bring it back. `Remove-AptStaleAsset` deletes the assets nothing records any more:
 
 ```powershell
 Remove-AptStaleAsset -WhatIf    # what would go
 Remove-AptStaleAsset            # asks before each one
 ```
 
-Deleting is permanent: a pruned version comes back only by uploading it again
-from its `iot-edge` release. A merged promotion branch you still have locally
-holds its files back; delete it first.
+An asset is kept while `main`'s `SHA256SUMS` records it, while the head of an
+open pull request does, while a branch in your checkout does, or while it is
+younger than 14 days (`-GraceDays`) — the window that covers a promotion
+committed but not pushed yet. Those branches are read from GitHub rather than
+from your remote-tracking refs, and the command refuses to run at all if it
+cannot read `main`'s `SHA256SUMS`.
+
+Deleting is permanent: a pruned version comes back only by promoting it again.
 
 ## How this repository is published
 
 `.github/workflows/publish.yml` rebuilds the whole index on each run:
 
-1. checks `SHA256SUMS` records exactly the `.deb` files the manifests name
-   between them — no more, no fewer — then downloads those files from the
-   `pool` release and refuses any whose hash differs,
+1. runs [`check-pool.sh`](check-pool.sh): `SHA256SUMS` has to record exactly the
+   `.deb` files the manifests name between them — no more, no fewer — and every
+   file downloaded from the `pool` release has to match its recorded hash. A
+   pull request runs this same script on its own, with no secrets, so a
+   promotion whose files are missing fails before the merge rather than after,
 2. generates one `Packages`/`Release` tree per suite over that shared pool, and
    stamps each with a 90-day `Valid-Until`,
 3. clear-signs `InRelease` and detach-signs `Release.gpg`, for both suites,
@@ -219,7 +225,7 @@ Consequences worth knowing before changing anything here:
 
 - **One pool, two suites.** `dists/stable` and `dists/beta` are separate
   indices over the same `pool/`, so a version that appears on both is stored
-  once. It also means anything that prunes the pool has to consider both
+  once. It also means anything that rewrites `SHA256SUMS` has to consider both
   manifests at once — `Sync-Pool` reads them itself rather than taking entries,
   precisely so it cannot be handed half the picture.
 - **The packages live on the `pool` release, not in git.** CI downloads them
