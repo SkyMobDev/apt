@@ -423,7 +423,8 @@ function Remove-AptStaleAsset {
 
     $open = @(gh api "repos/$repository/pulls?state=open&per_page=100" --jq '.[].head.sha' 2>$null)
     if ($LASTEXITCODE -ne 0) { throw "listing open pull requests of $repository failed" }
-    foreach ($sha in $open) {
+    # With nothing open gh prints nothing, which arrives here as one empty line.
+    foreach ($sha in @($open | Where-Object { $_ -and $_.Trim() })) {
         foreach ($name in @(Get-RecordedNames -Repository $repository -Ref $sha)) { [void]$recorded.Add($name) }
     }
 
