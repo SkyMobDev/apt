@@ -19,4 +19,5 @@
 #
 # Format is stable.list's: "<package> <version>", one per line.
 
+skbridge 0.1.49
 skprinter 0.1.5
